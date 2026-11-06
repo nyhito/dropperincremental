@@ -32,6 +32,11 @@ local completionSent=false
 local held=false
 local inputEpoch=0
 local activeInput=nil
+local lastRealInput=nil
+local injecting=0
+local injectedInputs=setmetatable({}, {__mode="k"})
+local nextModeScan=0
+local inputUnavailableAt=nil
 local modeIndex=1
 local modes={}
 local inputWorking=false
@@ -45,8 +50,9 @@ local dropDebug=nil
 local dropConnection=nil
 local startDropDebug,stopDropDebug
 local geometry={}
+local autoButton=nil
 local toggle,close,copy,setHeld,click,chooseMode
-local report={format="fishing-controller-v4-discovery",placeId=game.PlaceId,
+local report={format="fishing-controller-v5-native-bridge",placeId=game.PlaceId,
     note="Chama funcoes locais, sem ponteiro virtual. Controla a barra real. Caught so conta no ciclo iniciado/controlado pelo auto. Nao comprova remocao dos tempos de queda/mordida.",
     caught=0,escaped=0,manualOrUnownedCaught=0,manualTouches=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,
     events={},catches={},inputErrors={},capabilities={},recastDelay=0}
@@ -199,7 +205,7 @@ local function callbacks(signal,origin)
     local candidates,best={},0
     for key,c in pairs(all) do
         summary.total=summary.total+1
-        if summary.total>120 then summary.truncated=true break end
+        if summary.total>1024 then summary.truncated=true break end
         local errors={}
         -- Campos opcionais NAO podem invalidar Function. Alguns executores lancam erro ao le-los.
         local fn=type(c)=="function" and c or field(c,"Function",errors)
@@ -246,6 +252,122 @@ local function position()
     local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
     return math.floor(view.X*.78),math.floor(view.Y*.30)
 end
+-- Pontes nativas disparam sinais/funcoes da vara, sem mover mouse ou gerar toque na tela.
+local function nativeBindings(signal,origin)
+    local list=getconnections or env.getconnections
+    local summary={total=0,lua=0,foreignLua=0,defer=0,fire=0}
+    report.nativeDiscovery=report.nativeDiscovery or {} report.nativeDiscovery[origin]=summary
+    if type(list)~="function" or not signal then return {} end
+    local ok,all=pcall(list,signal)
+    if not ok or type(all)~="table" then summary.error=tostring(all):sub(1,120) return {} end
+    local result={}
+    for _,c in pairs(all) do
+        summary.total=summary.total+1 if summary.total>1024 then summary.truncated=true break end
+        if type(c)~="function" then
+            local lua=field(c,"LuaConnection")
+            local foreign=field(c,"ForeignState")
+            local on=field(c,"Enabled")
+            if lua==true and on~=false then
+                summary.lua=summary.lua+1
+                if foreign==true then
+                    summary.foreignLua=summary.foreignLua+1
+                    local method=field(c,"Defer") local methodName="Defer"
+                    if type(method)~="function" then method=field(c,"Fire") methodName="Fire" end
+                    if type(method)=="function" and #result<64 then
+                        result[#result+1]={connection=c,method=method,name=methodName}
+                        summary[methodName:lower()]=summary[methodName:lower()]+1
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+local function emitForeign(bindings,...)
+    local count,last=0,nil
+    for _,binding in ipairs(bindings) do
+        local ok,err=pcall(binding.method,binding.connection,...)
+        if ok then count=count+1 else last=err end
+    end
+    if count==0 then error(last or "Nenhuma conexao estrangeira foi acionada.") end
+end
+local function inputPacket(down,kind,reuse)
+    local input
+    if reuse and lastRealInput then input=lastRealInput
+    else
+        local x,y=position()
+        if down or not activeInput then activeInput={UserInputType=kind,KeyCode=Enum.KeyCode.Unknown,
+            Position=Vector3.new(x,y,0),Delta=Vector3.new(0,0,0)} end
+        activeInput.UserInputState=down and Enum.UserInputState.Begin or Enum.UserInputState.End
+        input=activeInput
+    end
+    injectedInputs[input]=os.clock()
+    return input
+end
+local function signalPair(name,beginSignal,endSignal)
+    if not beginSignal or not endSignal then return end
+    local nativeBegin=nativeBindings(beginSignal,name..".Begin")
+    local nativeEnd=nativeBindings(endSignal,name..".End")
+    if #nativeBegin>0 and #nativeEnd>0 then
+        modes[#modes+1]={name=name.." / conexoes nativas",press=function(down)
+            emitForeign(down and nativeBegin or nativeEnd)
+        end}
+    end
+    local fire=firesignal or env.firesignal
+    local b=report.nativeDiscovery[name..".Begin"]
+    local e=report.nativeDiscovery[name..".End"]
+    local listenersUnknown=type(getconnections or env.getconnections)~="function"
+    if type(fire)=="function" and (listenersUnknown or (b and e and b.total>0 and e.total>0)) then
+        modes[#modes+1]={name=name.." / sinal local",press=function(down)
+            injecting=injecting+1
+            local ok,err=pcall(fire,down and beginSignal or endSignal)
+            injecting=injecting-1
+            if not ok then error(err) end
+        end}
+    end
+end
+local function addNativeModes(tool)
+    if not tool then return end
+    -- Activate/Deactivate pertencem a ferramenta; nao fazem hit-test de botoes da tela.
+    modes[#modes+1]={name="FishingRod / Activate",press=function(down)
+        local r=rod() or tool
+        if down then r:Activate() else r:Deactivate() end
+    end}
+    pcall(function()
+        local mouse=player:GetMouse()
+        if mouse then signalPair("Mouse.Button1",mouse.Button1Down,mouse.Button1Up) end
+    end)
+    signalPair("FishingRod.Events",tool.Activated,tool.Deactivated)
+    local begins=nativeBindings(UIS.InputBegan,"UIS.InputBegan")
+    local ends=nativeBindings(UIS.InputEnded,"UIS.InputEnded")
+    local kinds={Enum.UserInputType.MouseButton1,Enum.UserInputType.Touch}
+    if #begins>0 and #ends>0 then
+        local variants=lastRealInput and {"real","mouse","touch"} or {"mouse","touch"}
+        for _,variant in ipairs(variants) do
+            local mode=variant
+            modes[#modes+1]={name="UIS / conexoes nativas / "..mode,press=function(down)
+                local kind=mode=="touch" and kinds[2] or kinds[1]
+                emitForeign(down and begins or ends,inputPacket(down,kind,mode=="real"),false)
+            end}
+        end
+    end
+    local fire=firesignal or env.firesignal
+    if type(fire)=="function" then
+        local variants=lastRealInput and {"real","mouse","touch"} or {"mouse","touch"}
+        for _,variant in ipairs(variants) do
+            local mode=variant
+            modes[#modes+1]={name="UIS / sinal local / "..mode,press=function(down)
+                local kind=mode=="touch" and kinds[2] or kinds[1]
+                local packet=inputPacket(down,kind,mode=="real")
+                injecting=injecting+1
+                local ok,err=pcall(fire,down and UIS.InputBegan or UIS.InputEnded,packet,false)
+                injecting=injecting-1
+                if not ok then error(err) end
+            end}
+        end
+    end
+end
+
 local function refreshModes()
     modes={}
     local begins,ends=callbacks(UIS.InputBegan,"InputBegan"),callbacks(UIS.InputEnded,"InputEnded")
@@ -292,8 +414,11 @@ local function refreshModes()
             end}
         end
     end
+    addNativeModes(tool)
+    local preferred=env.__NetoFishingInputMethod
+    for i,mode in ipairs(modes) do if mode.name==preferred then table.remove(modes,i) table.insert(modes,1,mode) break end end
     modeIndex=1 modeFault=false
-    report.capabilities={getconnections=type(getconnections or env.getconnections)=="function",getconstants=debug and type(debug.getconstants)=="function",getupvalues=debug and type(debug.getupvalues)=="function",inputModes=#modes,physicalInput=false}
+    report.capabilities={getconnections=type(getconnections or env.getconnections)=="function",getconstants=debug and type(debug.getconstants)=="function",getupvalues=debug and type(debug.getupvalues)=="function",inputModes=#modes,physicalInput=false,firesignal=type(firesignal or env.firesignal)=="function",realInput=lastRealInput~=nil,nativeMethods=true,actorBridge=type(run_on_actor or env.run_on_actor)=="function",actorInventory=type(getactors or env.getactors)=="function"}
 end
 setHeld=function(down,force)
     if down and (not alive or not enabled) then return false end
@@ -301,7 +426,10 @@ setHeld=function(down,force)
     local mode=modes[modeIndex]
     if not mode then return false end
     local ok,err=pcall(mode.press,down)
-    if not ok then inputError(err) return false end
+    if not ok then
+        if down then pcall(mode.press,false) end
+        inputError(err) return false
+    end
     held=down report.holdChanges=report.holdChanges+1
     report.inputMode=mode.name
     return true
@@ -316,7 +444,8 @@ chooseMode=function(reason)
     record("input","Switch",reason)
     modeIndex=modeIndex+1
     if modeIndex>#modes then
-        enabled=false phase="Funcao local nao confirmada. Copie o resultado."
+        enabled=false phase="Controle nativo nao confirmou o clique. Copie o resultado."
+        if autoButton then autoButton.Text="Auto Fish: OFF" end
         return false
     end
     report.inputMode=modes[modeIndex].name
@@ -351,7 +480,7 @@ local title=Instance.new("TextLabel") title.Text="AUTO FISH / FUNCOES LOCAIS" ti
  title.TextColor3=Color3.new(1,1,1) title.BackgroundTransparency=1 title.Active=true
  title.Position=UDim2.fromOffset(10,3) title.Size=UDim2.fromOffset(224,30) title.Parent=panel
 local minimize=button("-",242,6,26,26) local exit=button("X",276,6,26,26)
-local autoButton=button("Auto Fish: OFF",10,42,292,36)
+autoButton=button("Auto Fish: OFF",10,42,292,36)
 local intervalLabel=Instance.new("TextLabel") intervalLabel.Text="Relancar apos captura (s)" intervalLabel.Font=Enum.Font.Gotham intervalLabel.TextSize=12
  intervalLabel.TextColor3=Color3.new(1,1,1) intervalLabel.BackgroundTransparency=1
  intervalLabel.Position=UDim2.fromOffset(10,85) intervalLabel.Size=UDim2.fromOffset(190,30) intervalLabel.Parent=panel
@@ -582,6 +711,7 @@ local function onServer(action,...)
             stage="waitingBite" stateAt=os.clock() clickCount=0
             report.castsAccepted=report.castsAccepted+1
             inputWorking=true phase="Lancamento confirmado; aguardando !"
+            if modes[modeIndex] then env.__NetoFishingInputMethod=modes[modeIndex].name end
         end
     elseif action=="Bite" then
         if autoOwned and stage~="idle" then
@@ -611,6 +741,8 @@ local function onServer(action,...)
 end
 connect(fishing.OnClientEvent,onServer)
 connect(UIS.InputBegan,function(input,processed)
+    if injecting>0 or (injectedInputs[input] and os.clock()-injectedInputs[input]<.2) then return end
+    if typeof(input)=="InputObject" then lastRealInput=input end
     if not enabled or processed or not autoOwned then return end
     if input.UserInputType~=Enum.UserInputType.Touch and input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
     manualAssisted=true report.manualTouches=report.manualTouches+1
@@ -621,7 +753,13 @@ toggle=function(value)
     release()
     enabled=value==true
     resetCycle(enabled and "Chegue perto do lago" or "OFF")
-    if enabled then refreshModes() if #modes==0 then enabled=false phase="Sem funcao de entrada acessivel. Copie o resultado." end end
+    inputUnavailableAt=nil nextModeScan=0
+    if enabled then
+        if rod() then
+            refreshModes()
+            if #modes==0 then phase="Aguardando inicializacao dos controles da vara" end
+        else phase="Auto ligado; aproxime-se do lago para equipar a vara" end
+    end
     autoButton.Text=enabled and "Auto Fish: ON" or "Auto Fish: OFF"
 end
 copy=function()
@@ -682,7 +820,7 @@ close=function()
     gui:Destroy()
 end
 env.FishingAutoTest={Toggle=toggle,Copy=copy,Close=close,Report=report,StartDropDebug=function() startDropDebug() end,StopDropDebug=function() stopDropDebug(true) end}
-connect(autoButton.Activated,function() toggle() end)
+connect(autoButton.Activated,function(input) if typeof(input)=="InputObject" then lastRealInput=input end toggle() end)
 connect(copyButton.Activated,copy)
 connect(dropButton.Activated,function() if dropDebug and dropDebug.running then stopDropDebug(true) else startDropDebug() end end)
 connect(exit.Activated,close)
@@ -703,7 +841,16 @@ local function step(dt)
     end
     if tool~=lastRod then
         release() refreshModes() lastRod=tool
-        if #modes==0 then enabled=false phase="Sem funcao de entrada acessivel. Copie o resultado." return end
+        inputUnavailableAt=nil nextModeScan=os.clock()+.5
+    end
+    if #modes==0 then
+        inputUnavailableAt=inputUnavailableAt or os.clock()
+        if os.clock()>=nextModeScan then refreshModes() nextModeScan=os.clock()+.5 end
+        if #modes==0 then
+            phase="Vara equipada; procurando controle nativo"
+            if os.clock()-inputUnavailableAt>3 then toggle(false) phase="Controle nativo indisponivel. Copie o resultado." end
+            return
+        end
     end
     if modeFault then
         if not chooseMode("Falha no callback de entrada") then return end
