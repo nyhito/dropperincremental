@@ -18,14 +18,15 @@ local function current(token) return alive and running and generation==token end
 local started=0
 local links,sessionLinks={},{}
 local own=setmetatable({}, {__mode="k"})
-local report={format="dig-debug-v2-auto",placeId=game.PlaceId}
+local report={format="dig-debug-v3-reactive",placeId=game.PlaceId}
 local refs={objects={}}
 local bound=setmetatable({}, {__mode="k"})
 local pendingButtons={}
 local monitored,remoteInfo={},{}
 local visual=nil
+local visualPending=false
 local start,stop,copy,close,testZone
-local toggleAuto,toggleTP,autoStep,onTreasure
+local toggleAuto,toggleTP,autoStep,onTreasure,cacheFast,pulse
 local auto={enabled=false,tp=false,phase="OFF"}
 local function at() return math.floor((os.clock()-started)*1000+.5)/1000 end
 local function listen(signal,fn,list)
@@ -196,7 +197,14 @@ local function geometry()
     local left,w=track.AbsolutePosition.X,track.AbsoluteSize.X
     local cursor=(marker.AbsolutePosition.X+marker.AbsoluteSize.X*.5-left)/w
     local lo=(zone.AbsolutePosition.X-left)/w local width=zone.AbsoluteSize.X/w
-    local r={cursor=cursor,greenStart=lo,greenWidth=width,inside=cursor>=lo and cursor<=lo+width}
+    local mode="absolute"
+    if marker.Parent==track and zone.Parent==track and marker.Position.X.Offset==0 and marker.Size.X.Offset==0 and zone.Position.X.Offset==0 and zone.Size.X.Offset==0 then
+        width=zone.Size.X.Scale
+        lo=zone.Position.X.Scale-zone.AnchorPoint.X*width
+        cursor=marker.Position.X.Scale+(.5-marker.AnchorPoint.X)*marker.Size.X.Scale
+        mode="scale_properties"
+    end
+    local r={cursor=cursor,greenStart=lo,greenWidth=width,inside=cursor>=lo and cursor<=lo+width,mode=mode}
     if visual then r.insideOriginal=cursor>=visual.originalStart and cursor<=visual.originalStart+visual.originalWidth r.visualTest=true end
     return r
 end
@@ -241,14 +249,36 @@ local function readHud()
     for _,obj in ipairs(refs.objects) do
         if isText(obj) and shown(obj) then
             local s=clean(obj.Text)
-            if s:find("digging",1,true) or s:find("hit the green zone",1,true) or s:find("try the next sweep",1,true) then phase="digging" end
+            if s:find("digging",1,true) or s:find("auto dig",1,true) or s:find("hit the green zone",1,true) or s:find("try the next sweep",1,true) then phase="digging" end
             if s:find("signal",1,true) then signal=tonumber(s:match("([%d.]+)%%")) if phase~="digging" then phase="signal" end end
             if s:find("searching the beach",1,true) and phase=="unknown" then phase="searching" end
-            if s:find("layer",1,true) then layer=s:match("(%d+%s*/%s*%d+)") or layer end
+            if s:find("layer",1,true) then local value=s:match("(%d+%s*/%s*%d+)") if value then layer=value:gsub("%s","") end end
             if #s>0 and (s=="dig" or s:find("signal",1,true) or s:find("layer",1,true) or s:find("miss",1,true) or s:find("search",1,true)) and #texts<8 then texts[#texts+1]={path=path(obj),text=obj.Text:sub(1,110)} end
         end
     end
     return phase,signal,layer,texts
+end
+cacheFast=function()
+    local front=pg:FindFirstChild("Front") local main=front and front:FindFirstChild("MainFrame")
+    local hud=(main and main:FindFirstChild("TreasureHUD")) or refs.hud
+    if not hud or not hud.Parent then return end
+    if refs.hud~=hud then refs.hud=hud report.hud=path(hud) refreshObjects() end
+    local action=hud:FindFirstChild("Action") if action and action:IsA("GuiButton") and not bound[action] then bindButton(action) end
+    local track=hud:FindFirstChild("Track") or refs.track
+    if not track then return end
+    local zone=track:FindFirstChild("Zone") or track:FindFirstChild("GreenZone") or refs.zone
+    local marker=track:FindFirstChild("Needle") or track:FindFirstChild("Cursor") or refs.marker
+    if not zone or not marker then return end
+    refs.track,refs.zone,refs.marker=track,zone,marker
+    if refs.watchedMarker~=marker then
+        refs.watchedMarker=marker local token=generation
+        local function changed()
+            if current(token) then refs.markerRevision=(refs.markerRevision or 0)+1 if pulse then pulse() end end
+        end
+        listen(marker:GetPropertyChangedSignal("Position"),changed)
+        listen(marker:GetPropertyChangedSignal("Visible"),changed)
+        report.geometry={zone=snapshot(zone),track=snapshot(track),marker=snapshot(marker),confidence="known_TreasureHUD_paths"}
+    end
 end
 local lastTap=-math.huge
 local function bindButton(obj)
@@ -531,8 +561,7 @@ end
 local function serverNow()
     local ok,value=pcall(function() return workspace:GetServerTimeNow() end)
     if ok and type(value)=="number" then return value end
-    -- A camada fornece uma referencia no mesmo relogio; nao usa o relogio do celular.
-    if auto.layer then return auto.layer.started+os.clock()-auto.layer.receivedAt end
+    if report.auto then report.auto.clockError="GetServerTimeNow indisponivel" end
 end
 local function sync()
     if os.clock()-(auto.lastSync or -math.huge)<1 then return end
@@ -574,14 +603,25 @@ onTreasure=function(action,...)
             auto.layer={id=args[1],started=args[2],index=args[3],center=args[4],width=args[5],receivedAt=os.clock(),key=key,armed=true}
             auto.pending=nil auto.phase=auto.enabled and "Esperando o traco entrar no verde" or "OFF"
         end
+        cacheFast()
+        if visual then testZone(false,true) end
         local record={token=args[1],started=args[2],index=args[3],center=args[4],width=args[5],argCount=args.n+1,extra={}}
         for i=6,math.min(args.n,11) do record.extra[tostring(i+1)]=short(args[i],0,{left=12}) end
         if report.auto then report.auto.layer=record end
         autoLog("server","Layer",record)
     elseif action=="Hit" then
+        local visualReply=visual~=nil
+        if visual then
+            visual.record.accepted=args[1] visual.record.replyAt=at()
+            visual.record.replyGeometry=geometry()
+            testZone(false)
+        end
         if auto.enabled then
             local pending=auto.pending auto.pending=nil
+            if visualReply and args[1]==true and auto.layer then auto.layer.completed=true end
             if pending and auto.layer and pending.layerKey==auto.layer.key then
+                local rtt=os.clock()-pending.sentAt
+                auto.rtt=auto.rtt and auto.rtt*.75+rtt*.25 or rtt report.auto.replyMs=math.floor(auto.rtt*1000+.5)
                 if args[1]==true then
                     report.auto.confirmedHits=report.auto.confirmedHits+1 auto.layer.completed=true
                     auto.phase="Acerto confirmado; aguardando camada"
@@ -593,6 +633,7 @@ onTreasure=function(action,...)
             autoLog("server","Hit",{accepted=args[1],value2=short(args[2],0,{left=8}),value3=short(args[3],0,{left=8})})
         end
     elseif action=="Found" then
+        if visual then testZone(false) end
         if auto.enabled then
             report.auto.foundWhileEnabled=report.auto.foundWhileEnabled+1
             autoLog("server","Found",{item=short(args[1],0,{left=8}),amount=short(args[2],0,{left=8})})
@@ -609,30 +650,40 @@ autoStep=function()
     if now<(auto.settleUntil or 0) then return end
     if auto.layer then
         local layer=auto.layer
+        if visual or visualPending then auto.phase="Teste verde: toque Dig fora da faixa original" return end
         if layer.completed then
             if now-layer.receivedAt>2 and now-(auto.lastSync or 0)>2 then sync() end
             return
         end
         if auto.pending then
-            if now-auto.pending.sentAt<1 then return end
-            autoLog("timeout","Strike") auto.pending=nil layer.armed=false layer.retryAfter=now+.15
+            local limit=math.clamp((auto.rtt or .07)*2.5+.025,.16,.55)
+            if now-auto.pending.sentAt<limit then return end
+            autoLog("timeout","Strike") auto.pending=nil layer.armed=true layer.retryAfter=now
             report.auto.timeouts=report.auto.timeouts+1
+            layer.retries=(layer.retries or 0)+1
+            if layer.retries>2 then layer.retryAfter=now+.3 sync() end
         end
         local g=geometry()
-        if not g or not refs.track or not shown(refs.track) then auto.phase="Camada recebida; procurando faixa e traco" return end
+        if not g or not refs.track or not shown(refs.track) or not shown(refs.zone) or not shown(refs.marker) then auto.phase="Camada recebida; aguardando traco visivel" return end
         if visual then
             -- A automacao usa a faixa original mesmo durante o teste visual.
             g.greenStart=visual.originalStart g.greenWidth=visual.originalWidth
         end
-        local margin=math.min(.035,g.greenWidth*.12)
+        if type(layer.center)=="number" and type(layer.width)=="number" and (math.abs(g.greenStart+g.greenWidth*.5-layer.center)>.02 or math.abs(g.greenWidth-layer.width)>.02) then
+            auto.phase="Aguardando a faixa da camada atual" return
+        end
+        local margin=g.mode=="scale_properties" and .006 or .025
+        margin=math.min(margin,g.greenWidth*.08)
         local inside=g.cursor>=g.greenStart+margin and g.cursor<=g.greenStart+g.greenWidth-margin
         if not inside then layer.armed=true return end
-        if not layer.armed or now<(layer.retryAfter or 0) or now-layer.receivedAt<.025 then return end
+        if not layer.firstGreenAt then layer.firstGreenAt=now end
+        if not layer.armed or now<(layer.retryAfter or 0) then return end
         local timestamp=serverNow() if not timestamp then auto.phase="Sem relogio para Strike" return end
+        if timestamp<layer.started+.004 then return end
         layer.armed=false auto.pending={sentAt=now,layerKey=layer.key}
         auto.phase="Enviando Strike no verde"
         report.auto.strikes=report.auto.strikes+1
-        autoLog("send","Strike",{token=layer.id,time=timestamp,geometry=g})
+        autoLog("send","Strike",{token=layer.id,time=timestamp,geometry=g,layerAge=timestamp-layer.started,greenReactionMs=math.floor((now-layer.firstGreenAt)*1000+.5)})
         if not send("Strike",layer.id,timestamp) then auto.pending=nil layer.retryAfter=now+.5 end
         return
     end
@@ -654,7 +705,7 @@ autoStep=function()
 end
 toggleAuto=function(value)
     if value==nil then value=not auto.enabled end
-    if value and not running then start() end
+    if value and not running then start(true) end
     auto.enabled=value==true and running
     autoButton.Text=auto.enabled and "Auto Dig: ON" or "Auto Dig: OFF"
     if report.auto then report.auto.enabled=auto.enabled end
@@ -673,7 +724,8 @@ toggleTP=function(value)
 end
 
 testZone=function(value,preserveGameChange)
-    if value==nil then value=visual==nil end
+    if value==nil then value=visual==nil and not visualPending end
+    if not value then visualPending=false end
     if not value and visual then
         local old=visual visual=nil
         local function same(a,b) return a.X.Scale==b.X.Scale and a.X.Offset==b.X.Offset and a.Y.Scale==b.Y.Scale and a.Y.Offset==b.Y.Offset end
@@ -684,18 +736,39 @@ testZone=function(value,preserveGameChange)
         old.record.gameChanged=preserveGameChange or nil
         old.record.stoppedAt=at() testButton.Text="Testar faixa verde: OFF" return
     end
-    if not value then return end
-    if not running or not refs.zone or not refs.zone.Parent or not refs.marker or not shown(refs.zone) then label.Text="Inicie o debug e espere o minigame com a faixa verde." return end
+    if not value then testButton.Text="Testar faixa verde: OFF" return end
+    if not running then start(true) end
+    cacheFast()
+    if not refs.zone or not refs.zone.Parent or not refs.marker or not shown(refs.zone) or not shown(refs.marker) or (auto.enabled and not auto.layer) then
+        visualPending=true testButton.Text="Teste verde: aguardando barra"
+        label.Text="Teste armado para a proxima barra. O Auto pausa os golpes para voce testar um clique." return
+    end
     if visual then return end
     local g=geometry() if not g then return end
     local zone=refs.zone
-    local row={startedAt=at(),path=path(zone),originalStart=g.greenStart,originalWidth=g.greenWidth,taps=0,outsideOriginalTaps=0,transitions={},changes="visual_only"}
+    local _,_,hudLayer=readHud()
+    local row={startedAt=at(),path=path(zone),layer=hudLayer,originalStart=g.greenStart,originalWidth=g.greenWidth,taps=0,outsideOriginalTaps=0,transitions={},changes="visual_only"}
     add(report.visualTests,row,4)
-    visual={obj=zone,size=zone.Size,position=zone.Position,record=row,originalStart=g.greenStart,originalWidth=g.greenWidth,
+    visualPending=false
+    visual={obj=zone,size=zone.Size,position=zone.Position,record=row,hudLayer=hudLayer,originalStart=g.greenStart,originalWidth=g.greenWidth,expiresAt=os.clock()+8,
         testSize=UDim2.new(1,0,zone.Size.Y.Scale,zone.Size.Y.Offset),testPosition=UDim2.new(zone.AnchorPoint.X,0,zone.Position.Y.Scale,zone.Position.Y.Offset)}
     zone.Size=visual.testSize zone.Position=visual.testPosition
     testButton.Text="Restaurar faixa verde"
     label.Text="Faixa VISUAL ampliada. Compare um clique fora da faixa original; camada e eventos dirao se foi aceito."
+end
+
+local stepping=false
+pulse=function()
+    if not running or stepping then return end
+    stepping=true
+    local ok,err=pcall(function()
+        if not refs.zone or not refs.zone.Parent or not refs.marker or not refs.marker.Parent then cacheFast() end
+        if visual and os.clock()>visual.expiresAt then testZone(false) end
+        if visualPending and refs.zone and refs.marker and shown(refs.zone) and shown(refs.marker) and (not auto.enabled or auto.layer) then testZone(true) end
+        if auto.enabled then autoStep() end
+    end)
+    stepping=false
+    if not ok then autoLog("error","controller",tostring(err):sub(1,180)) toggleAuto(false) auto.phase="Erro no controle; copie o resultado" end
 end
 
 local lastPhase,lastLayer,lastHud="unknown",nil,""
@@ -711,7 +784,7 @@ local function sampleState()
         add(report.transitions,event,18)
         if visual then
             add(visual.record.transitions,event,6)
-            if layer~=lastLayer or phase~="digging" then
+            if (visual.hudLayer and layer and layer~=visual.hudLayer) or phase=="searching" or phase=="signal" then
                 -- A new layer can already have written new coordinates: never put stale ones over it.
                 local changed=visual.obj.Size.X.Scale<.99 or visual.obj.Position.X.Scale~=visual.obj.AnchorPoint.X or visual.obj.Position.X.Offset~=0
                 testZone(false,changed)
@@ -763,7 +836,7 @@ local function sampleState()
     end
 end
 local function updateLabel()
-    if visual then return end
+    if visual or visualPending then return end
     if auto.enabled then label.Text=auto.phase.."\n"..(refs.zone and "Faixa/traco detectados" or "Aguardando a interface Dig").."\nUse Parar / copiar para enviar o teste."
     elseif running then label.Text="Gravando: "..math.floor(at()).."/30 s\n"..(refs.button and "Dig detectado" or "Procurando o botao Dig...").." | "..#report.calls.." grupos de eventos\nComplete um ciclo normal; o teste da faixa e opcional."
     else label.Text="Parado. Use Copiar resultado para enviar o diagnostico." end
@@ -795,6 +868,8 @@ copy=function()
         export.world=nil
         local function recent(list,count) local r={} for i=math.max(1,#list-count+1),#list do r[#r+1]=list[i] end return r end
         export.messages=recent(export.messages or {},6) export.taps=recent(export.taps or {},10)
+        local targets={} for _,target in ipairs(export.targets or {}) do if target.source and target.source:find("Remotes.TreasureHunting",1,true) then targets[#targets+1]=target end end
+        export.targets=recent(targets,6)
         if export.logic then export.logic.states=recent(export.logic.states or {},4) end
         for _,g in ipairs(export.calls) do while #g.variants>1 do table.remove(g.variants) end g.lastArgs=nil end
         payload=Http:JSONEncode(export)
@@ -807,9 +882,12 @@ copy=function()
     while #payload>19000 do
         if #(export.messages or {})>2 then table.remove(export.messages,1)
         elseif #(export.taps or {})>4 then table.remove(export.taps,1)
-        elseif #export.calls>3 then table.remove(export.calls) export.trimmedGroups=(export.trimmedGroups or 0)+1
         elseif export.logic then export.logic=nil
         elseif export.geometry then export.geometry=nil
+        elseif #export.calls>3 then
+            local index=#export.calls
+            for i=#export.calls,1,-1 do if export.calls[i].action=="Sync" or not export.calls[i].related then index=i break end end
+            table.remove(export.calls,index) export.trimmedGroups=(export.trimmedGroups or 0)+1
         else break end
         payload=Http:JSONEncode(export)
     end
@@ -821,31 +899,29 @@ copy=function()
     return payload
 end
 stop=function(shouldCopy)
+    visualPending=false
     toggleAuto(false)
     if running then drain() testZone(false) running=false generation=generation+1 probe.enabled=false probe.allowed={} disconnect(sessionLinks)
         report.seconds=at() report.running=false end
     startButton.Text="Iniciar debug (30 s)" updateLabel()
     if shouldCopy~=false then return copy() end
 end
-start=function()
+start=function(lightMode)
     if not alive or running then return end
     started=os.clock() running=true generation=generation+1 local token=generation refs={objects={}}
     bound=setmetatable({}, {__mode="k"}) pendingButtons={} targetKeys={} groupKeys={} remoteInfo={} monitored={}
     lastPhase,lastLayer,lastHud="unknown",nil,"" movement=nil lastPos=nil lastPosAt=nil lastTap=-math.huge
-    auto={enabled=false,tp=auto.tp,phase="OFF",waitingSince=os.clock()}
-    report={format="dig-debug-v2-auto",placeId=game.PlaceId,note="Auto opcional: Dig e Strike no verde real, com horario atual. TP opcional so para Spot do servidor. Found conta enquanto ligado e nao distingue ajuda manual. Faixa visual ampliada nao prova acerto fora do original.",
+    auto={enabled=false,tp=auto.tp,phase="OFF",waitingSince=os.clock()} visualPending=false
+    report={format="dig-debug-v3-reactive",placeId=game.PlaceId,note="Auto por posicao atual do traco, sem clique de tela. TP opcional para Spot. Faixa visual tem teste manual separado e nao prova tolerancia real. Found enquanto ligado nao distingue ajuda manual.",
         calls={},remoteInventory={},taps={},transitions={},messages={},targets={},movement={},visualTests={},dropped=0,logic={status="scanning",scripts={},signals={},functions={},states={}},world={},tools={}}
     report.auto={enabled=false,tp=auto.tp,digs=0,strikes=0,confirmedHits=0,misses=0,foundWhileEnabled=0,teleports=0,timeouts=0,events={}}
     probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.allowed={} probe.seen={}
     local remotes=RS:FindFirstChild("Remotes")
     if remotes then for _,obj in ipairs(remotes:GetDescendants()) do attachRemote(obj) end listen(remotes.DescendantAdded,attachRemote) end
     local supported,err=installProbe() report.outgoingCapture=supported report.captureError=err probe.enabled=supported
-    listen(Run.RenderStepped,function()
-        if current(token) and auto.enabled then
-            local ok,err=pcall(autoStep)
-            if not ok then autoLog("error","controller",tostring(err):sub(1,180)) toggleAuto(false) auto.phase="Erro no controle; copie o resultado" end
-        end
-    end)
+    cacheFast()
+    listen(Run.RenderStepped,function() if current(token) then pulse() end end)
+    if Run.Heartbeat then listen(Run.Heartbeat,function() if current(token) then pulse() end end) end
     listen(pg.DescendantAdded,function(obj)
         if obj:IsA("GuiButton") and not obj:IsDescendantOf(gui) then
             if #pendingButtons<320 then pendingButtons[#pendingButtons+1]=obj end
@@ -854,7 +930,12 @@ start=function()
     end)
     startButton.Text="Debug gravando..." output.Visible=false
     task.spawn(function()
-        local ok,err=pcall(function() discoverUi(token) if current(token) then inspectWorld(token) end if current(token) then inspectLogic(token) end end)
+        local ok,err=pcall(function()
+            if not refs.button then discoverUi(token) end
+            if current(token) then cacheFast() end
+            if lightMode==true or auto.enabled then report.logic.status="light_auto_mode"
+            else if current(token) then inspectWorld(token) end if current(token) then inspectLogic(token) end end
+        end)
         if not ok and current(token) then report.logic.error=tostring(err):sub(1,220) end
     end)
     task.spawn(function()
