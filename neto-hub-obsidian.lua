@@ -55,7 +55,7 @@ Library.NotifyOnError=true
 local viewport=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
 local Window=Library:CreateWindow({
     Title="Neto Hub",
-    Footer="Neto Hub | v2.0 | Obsidian UI",
+    Footer="Neto Hub | v2.1 | Obsidian UI",
     Icon="triangle",
     Center=true,
     AutoShow=true,
@@ -604,14 +604,22 @@ end
 local watchGeneration=0
 local scopes={}
 local queue,head,tail={},1,0
-local pumping=false
-local enqueue,pump
+local pumping,scheduled=false,false
+local pending={}
+local budgetAt,budgetUsed,budgetCost=-math.huge,0,0
+local wakeScheduled=false
+local enqueue,pump,wakePending
+local function dispatchBudget()
+    local now=os.clock()
+    if now-budgetAt>=.016 then budgetAt=now budgetUsed=0 budgetCost=0 end
+    return budgetUsed<24 and budgetCost<.002
+end
 local function running(generation)
     return alive and floor.enabled and watchGeneration==generation
 end
 local function resetQueue() queue={} head=1 tail=0 end
 local function disposeRecord(r)
-    r.active=false r.queued=false
+    r.active=false r.queued=false pending[r]=nil r.retryTicket=(r.retryTicket or 0)+1
     disconnect(r.links) disconnect(r.colors)
 end
 local function disposeScope(state)
@@ -624,6 +632,7 @@ stopFloor=function()
     watchGeneration=watchGeneration+1
     for _,state in ipairs(scopes) do disposeScope(state) end
     scopes={}
+    pending={}
     resetQueue()
 end
 local function yellowNow(r)
@@ -647,43 +656,84 @@ local function request(r,generation)
     if t.method=="FireServer" and event:IsA("RemoteEvent") then event:FireServer(table.unpack(values,1,values.n))
     elseif t.method=="InvokeServer" and event:IsA("RemoteFunction") then event:InvokeServer(table.unpack(values,1,values.n)) end
 end
-pump=function(generation)
-    if pumping then return end
-    pumping=true
-    task.spawn(function()
-        while running(generation) and head<=tail do
-            local began,batch=os.clock(),0
-            while running(generation) and head<=tail and batch<8 and os.clock()-began<.002 do
-                local r=queue[head] queue[head]=nil head=head+1
-                r.queued=false batch=batch+1
-                if yellowNow(r) and not r.busy then
-                    local elapsed=os.clock()-r.last
-                    if elapsed>=2 then
-                        r.last=os.clock() r.busy=true
-                        local turn=r.turn
-                        task.spawn(function()
-                            local ok,err=pcall(request,r,generation)
-                            r.busy=false
-                            if not ok and not r.reported then r.reported=true warn("Neto Hub / piso: "..tostring(err)) end
-                            if running(generation) and yellowNow(r) and r.turn~=turn then enqueue(r,generation) end
-                        end)
-                        task.delay(2,function() if running(generation) and yellowNow(r) then enqueue(r,generation) end end)
-                    else
-                        task.delay(2-elapsed,function() if running(generation) and yellowNow(r) then enqueue(r,generation) end end)
-                    end
-                end
-            end
-            if head<=tail then task.wait() end
-        end
-        pumping=false
-        if head>tail then resetQueue() end
-        if floor.enabled and alive and head<=tail then pump(watchGeneration) end
+local function retryLater(r,generation)
+    if not running(generation) or not yellowNow(r) then return end
+    r.retryTicket=(r.retryTicket or 0)+1
+    local ticket=r.retryTicket
+    local delay=r.retryDelay or .08
+    r.retryDelay=math.min(delay*2,.5)
+    task.delay(delay,function()
+        if r.retryTicket==ticket and running(generation) and yellowNow(r) then enqueue(r,generation) end
     end)
+end
+local function dispatch(r,generation)
+    r.busy=true r.again=false
+    r.last=os.clock()
+    local function send()
+        local began=os.clock()
+        local ok,err=pcall(request,r,generation)
+        if r.template.method=="FireServer" then budgetCost=budgetCost+(os.clock()-began) end
+        r.busy=false
+        if not ok and not r.reported then r.reported=true warn("Neto Hub / piso: "..tostring(err)) end
+        if not running(generation) or not yellowNow(r) then return end
+        if r.again then r.again=false enqueue(r,generation) else retryLater(r,generation) end
+    end
+    -- FireServer nao espera resposta: dispara no proprio evento de cor/aparecimento.
+    -- InvokeServer tem seu proprio trabalho para nunca bloquear os outros pisos.
+    local event=r.remote
+    if event and event:IsA("RemoteEvent") then send() else task.spawn(send) end
+end
+pump=function(generation)
+    if pumping or not running(generation) then return end
+    pumping=true
+    while running(generation) and head<=tail and dispatchBudget() do
+        local r=queue[head] queue[head]=nil head=head+1 r.queued=false
+        if yellowNow(r) then
+            if r.busy then r.again=true
+            else
+                budgetUsed=budgetUsed+1
+                r.retryTicket=(r.retryTicket or 0)+1
+                dispatch(r,generation)
+            end
+        end
+    end
+    pumping=false
+    if head>tail then resetQueue() end
+    if head<=tail and not scheduled then
+        scheduled=true
+        task.spawn(function()
+            task.wait() scheduled=false
+            if floor.enabled and alive then pump(watchGeneration) end
+        end)
+    end
 end
 enqueue=function(r,generation)
     if not running(generation) or r.queued or not yellowNow(r) then return end
+    pending[r]=true
     r.queued=true tail=tail+1 queue[tail]=r
     pump(generation)
+end
+-- Uma compra pode liberar varios amarelos que ja tinham um pedido pendente.
+-- Reavalia apenas esses registros, sem percorrer o mapa ou esperar o retry antigo.
+wakePending=function(generation)
+    if wakeScheduled or not running(generation) then return end
+    wakeScheduled=true
+    local defer=task.defer or task.spawn
+    defer(function()
+        wakeScheduled=false
+        if not running(generation) then return end
+        local list={} for r in pairs(pending) do list[#list+1]=r end
+        local n,began=0,os.clock()
+        for _,r in ipairs(list) do
+            if not running(generation) then return end
+            if yellowNow(r) then
+                r.retryDelay=.08
+                enqueue(r,generation)
+                n=n+1
+                if n%24==0 or os.clock()-began>=.002 then task.wait() began=os.clock() end
+            else pending[r]=nil end
+        end
+    end)
 end
 local function watchItem(state,item,generation)
     if state.records[item] or not state.active or not running(generation) then return end
@@ -693,15 +743,23 @@ local function watchItem(state,item,generation)
     state.records[item]=r
     local function check()
         local yellow=yellowNow(r)
-        if yellow and not r.wasYellow then r.last=-math.huge r.turn=r.turn+1 end
+        local wasYellow=r.wasYellow
+        if yellow and not wasYellow then r.last=-math.huge r.turn=r.turn+1 r.retryDelay=.08 end
         r.wasYellow=yellow
-        if yellow then enqueue(r,generation) end
+        if yellow then
+            if not wasYellow then enqueue(r,generation) end
+        else
+            pending[r]=nil r.retryTicket=(r.retryTicket or 0)+1
+            if wasYellow then wakePending(generation) end
+        end
     end
     local function bindColor()
         if not r.active or not running(generation) then return end
         disconnect(r.colors)
         local part=descend(item,t.colorSteps)
-        r.part=part and part:IsA("BasePart") and part or nil
+        local nextPart=part and part:IsA("BasePart") and part or nil
+        if nextPart~=r.part then r.wasYellow=false r.retryTicket=(r.retryTicket or 0)+1 end
+        r.part=nextPart
         if r.part then
             listen(r.part:GetPropertyChangedSignal("Color"),check,r.colors)
             listen(r.part:GetPropertyChangedSignal("Transparency"),check,r.colors)
@@ -713,10 +771,11 @@ local function watchItem(state,item,generation)
         task.spawn(function() task.wait() r.rebinding=false bindColor() end)
     end
     if #t.colorSteps>0 then
-        listen(item.DescendantAdded,rebind,r.links)
+        listen(item.DescendantAdded,bindColor,r.links)
         listen(item.DescendantRemoving,rebind,r.links)
     end
-    if t.kind=="attribute" then listen(item:GetAttributeChangedSignal(t.attribute),check,r.links) end
+    if t.kind=="attribute" then listen(item:GetAttributeChangedSignal(t.attribute),function() r.wasYellow=false check() end,r.links)
+    elseif t.kind=="name" then listen(item:GetPropertyChangedSignal("Name"),function() r.wasYellow=false check() end,r.links) end
     bindColor()
 end
 local function scopeNames(t)
@@ -732,7 +791,7 @@ local function watchTemplate(t,generation)
     local function schedule()
         if state.scheduled or not state.active or not running(generation) then return end
         state.scheduled=true
-        task.spawn(function() task.wait() state.scheduled=false if state.active and running(generation) then rebuild() end end)
+        task.spawn(function() state.scheduled=false if state.active and running(generation) then rebuild() end end)
     end
     rebuild=function()
         if not state.active or not running(generation) then return end
@@ -752,7 +811,7 @@ local function watchTemplate(t,generation)
         state.scope=current
         listen(current.ChildAdded,function(item) watchItem(state,item,generation) end,state.links)
         listen(current.ChildRemoved,function(item)
-            local r=state.records[item] if r then disposeRecord(r) state.records[item]=nil end
+            local r=state.records[item] if r then local wasYellow=r.wasYellow disposeRecord(r) state.records[item]=nil if wasYellow then wakePending(generation) end end
         end,state.links)
         task.spawn(function()
             local began=os.clock()
