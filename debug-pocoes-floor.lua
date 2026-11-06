@@ -42,11 +42,14 @@ local dragging=false
 local autoButton=nil
 local toggle,close,copy,setHeld,click,chooseMode
 local startDropDebug,stopDropDebug
+local observeDropEvent=nil
+local diagnosticOwn=setmetatable({}, {__mode="k"})
 local report={format="fishing-controller-v8-stable-screen",placeId=game.PlaceId,
     note="Conta Caught recebido enquanto ligado; nao distingue ajuda manual. Cliques completos em frames separados sem minigame; durante a barra segue o peixe. Nao remove queda/mordida.",
     caught=0,escaped=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,recoveries=0,holdResyncs=0,
     events={},catches={},inputErrors={},capabilities={},interval=interval}
 local function connect(signal,fn)
+    diagnosticOwn[fn]=true
     local c=signal:Connect(fn) links[#links+1]=c return c
 end
 local function now() return math.floor((os.clock()-started)*1000+.5)/1000 end
@@ -262,46 +265,355 @@ local output=Instance.new("TextBox") output.Text="" output.MultiLine=true output
  output.Font=Enum.Font.Code output.TextSize=10 output.TextColor3=Color3.new(1,1,1) output.BackgroundColor3=Color3.fromRGB(29,31,39)
  output.TextXAlignment=Enum.TextXAlignment.Left output.TextYAlignment=Enum.TextYAlignment.Top
  output.Position=UDim2.fromOffset(0,268) output.Size=UDim2.fromOffset(312,135) output.Visible=false output.Parent=panel
--- Debug opcional de 12 s: observa bobber e eventos, sem alterar a animacao.
+-- Diagnostico da queda: leitura local, sem alterar constantes, funcoes ou posicoes.
+local function scanFallFunctions(d,active)
+    local dbg=debug or {}
+    local api={constants=dbg.getconstants or env.getconstants,upvalues=dbg.getupvalues or env.getupvalues,
+        protos=dbg.getprotos or env.getprotos,proto=dbg.getproto or env.getproto,
+        closure=getscriptclosure or env.getscriptclosure,senv=getsenv or env.getsenv,
+        gc=getgc or env.getgc,connections=getconnections or env.getconnections,
+        executor=isexecutorclosure or env.isexecutorclosure}
+    d.capabilities={}
+    for k,fn in pairs(api) do d.capabilities[k]=type(fn)=="function" end
+    local scripts=player:FindFirstChild("PlayerScripts")
+    local client=scripts and scripts:FindFirstChild("Client")
+    local main=client and client:FindFirstChild("Main")
+    d.script=main and main:GetFullName() or nil
+    local scan={status="scanning",inspected=0,queued=0,liveCandidates=0,metadataCandidates=0,errors={},signals={}}
+    d.scan=scan d.functions={}
+    local queue,seen={},setmetatable({}, {__mode="k"})
+    local head,ops,workAt=1,0,os.clock()
+    local function pause(limit)
+        ops=ops+1
+        if ops>=(limit or 4) or os.clock()-workAt>.0015 then task.wait(.025) ops=0 workAt=os.clock() end
+        return active()
+    end
+    local function fail(where,err)
+        if #scan.errors<8 then scan.errors[#scan.errors+1]={where=where,error=tostring(err):sub(1,160)} end
+    end
+    local function related(value)
+        local s=tostring(value):lower()
+        for _,word in ipairs({"fish","rod","bobber","bait","cast","reel","bite","hook","tween","lerp","duration","delay","travel","flight","gravity","velocity","fall","animation"}) do
+            if s:find(word,1,true) then return true end
+        end
+        return false
+    end
+    local function info(fn)
+        local src,name="",""
+        if dbg.info then pcall(function() src,name=dbg.info(fn,"sn") end)
+        elseif dbg.getinfo then pcall(function() local i=dbg.getinfo(fn,"Sn") src=i.source name=i.name end) end
+        if type(getfenv)=="function" then pcall(function()
+            local scope=getfenv(fn) local script=type(scope)=="table" and rawget(scope,"script")
+            if typeof(script)=="Instance" then src=script:GetFullName() end
+        end) end
+        return tostring(src or ""),tostring(name or "")
+    end
+    local function owned(fn)
+        if diagnosticOwn[fn] then return false end
+        if type(api.executor)=="function" then
+            local ok,isOwn=pcall(api.executor,fn)
+            if ok and isOwn then return false end
+        end
+        local src=info(fn) local lower=src:lower()
+        if lower:find("coregui",1,true) or lower:find("corepackages",1,true) or lower:find("playermodule",1,true) then return false end
+        return (d.script and src==d.script) or lower:find("playerscripts.client.main",1,true)
+            or (lower:find("playerscripts",1,true) and lower:find("fish",1,true))
+    end
+    local function add(fn,origin,path,live,bobberContext,parent,index,depth)
+        if type(fn)~="function" or diagnosticOwn[fn] or seen[fn] then return end
+        if #queue>=512 then scan.truncated=true return end
+        seen[fn]=true
+        queue[#queue+1]={fn=fn,origin=origin,path=path,live=live,bobberContext=bobberContext,parent=parent,index=index,depth=depth or 0}
+        scan.queued=#queue
+    end
+    local function retain(row)
+        d.functions[#d.functions+1]=row
+        table.sort(d.functions,function(a,b)
+            if a.score==b.score then return a.kind=="active-reference" and b.kind~="active-reference" end
+            return a.score>b.score
+        end)
+        if #d.functions>10 then table.remove(d.functions) end
+    end
+    local function inspect(entry)
+        local fn=entry.fn local src,name=info(fn)
+        if src=="" then src=d.script or "" end
+        local lower=name:lower()
+        local bobberContext=entry.bobberContext or lower:find("bobber",1,true)~=nil
+        local score=bobberContext and 100 or (lower:find("fish",1,true) and 70 or 0)
+        local rows,numeric={},{}
+        if type(api.constants)=="function" then
+            local ok,values=pcall(api.constants,fn)
+            if ok and type(values)=="table" then
+                local n=0
+                for index,value in next,values do
+                    n=n+1 if n>320 then break end
+                    if type(value)=="string" then
+                        local s=value:lower()
+                        if s:find("bobber",1,true) then score=score+100 bobberContext=true
+                        elseif s:find("fishing",1,true) or s:find("reelbar",1,true) then score=score+70
+                        elseif s=="cast" or s=="bite" or s=="caught" then score=score+15
+                        elseif s:find("lerp",1,true) or s:find("tween",1,true) or s:find("duration",1,true) then score=score+15 end
+                        if related(value) and #rows<20 then rows[#rows+1]={index=tostring(index),value=value:sub(1,90)} end
+                    elseif type(value)=="number" and value==value and math.abs(value)<=120 and #numeric<16 then
+                        numeric[#numeric+1]={index=tostring(index),value=value}
+                    end
+                end
+            end
+        end
+        if score>=70 then
+            local row={origin=entry.origin,path=entry.path,source=src,name=name,
+                kind=entry.live and "active-reference" or "metadata-only",score=score,constants={},upvalues={}}
+            for _,v in ipairs(numeric) do row.constants[#row.constants+1]=v end
+            for _,v in ipairs(rows) do if #row.constants<30 then row.constants[#row.constants+1]=v end end
+            if entry.live then scan.liveCandidates=scan.liveCandidates+1 else scan.metadataCandidates=scan.metadataCandidates+1 end
+            if entry.live and type(api.upvalues)=="function" then
+                local ok,values=pcall(api.upvalues,fn)
+                if ok and type(values)=="table" then
+                    local n=0
+                    for index,value in next,values do
+                        n=n+1 if n>32 then break end
+                        local kind=typeof(value)
+                        if type(value)=="function" then
+                            add(value,"upvalue",entry.path.."/u"..tostring(index),true,bobberContext)
+                        elseif type(value)=="table" then
+                            local selected,count={},0
+                            for key,item in next,value do
+                                count=count+1 if count>100 then break end
+                                if type(key)=="string" and related(key) and #selected<6 then
+                                    selected[#selected+1]={key=key:sub(1,70),value=safe(item,0,{left=6})}
+                                    if type(item)=="function" then add(item,"upvalue-field",entry.path.."/"..key,true,bobberContext) end
+                                end
+                            end
+                            if #selected>0 then row.upvalues[#row.upvalues+1]={index=tostring(index),fields=selected} end
+                        elseif (kind=="number" or kind=="boolean" or kind=="Vector3" or kind=="Instance") and #row.upvalues<10 then
+                            row.upvalues[#row.upvalues+1]={index=tostring(index),value=safe(value,0,{left=6})}
+                        elseif type(value)=="string" and related(value) and #row.upvalues<10 then
+                            row.upvalues[#row.upvalues+1]={index=tostring(index),value=value:sub(1,100)}
+                        end
+                    end
+                end
+            end
+            retain(row)
+            if entry.parent and entry.index and type(api.proto)=="function" then
+                local ok,instances=pcall(api.proto,entry.parent,entry.index,true)
+                if ok and type(instances)=="table" then
+                    for i,instance in ipairs(instances) do
+                        if i>4 then break end
+                        add(instance,"active-proto",entry.path.."/active"..i,true,bobberContext)
+                    end
+                end
+            end
+        end
+        if entry.depth~=7 and type(api.protos)=="function" then
+            local ok,children=pcall(api.protos,fn)
+            if ok and type(children)=="table" then
+                local count=0
+                for index,child in next,children do
+                    count=count+1 if count>512 then scan.truncated=true break end
+                    add(child,"prototype",entry.path.."/p"..tostring(index),false,bobberContext,fn,index,entry.depth+1)
+                    if not pause(16) then return false end
+                end
+            end
+        end
+        return true
+    end
+    local ok,err=pcall(function()
+        if main and type(api.closure)=="function" then
+            local good,fn=pcall(api.closure,main)
+            if good and type(fn)=="function" then add(fn,"script-copy","Main",false,false)
+            else fail("getscriptclosure",good and "closure unavailable" or fn) end
+        end
+        if main and type(api.senv)=="function" then
+            local good,scope=pcall(api.senv,main)
+            if good and type(scope)=="table" then
+                local count=0
+                for key,value in next,scope do
+                    count=count+1 if count>160 then break end
+                    if type(value)=="function" and (related(key) or owned(value)) then add(value,"script-env","env."..tostring(key),true,false) end
+                    if not pause(32) then return end
+                end
+            elseif not good then fail("getsenv",scope) end
+        end
+        if type(api.connections)=="function" then
+            for _,pair in ipairs({{fishing.OnClientEvent,"Fishing.OnClientEvent"},{Run.RenderStepped,"RenderStepped"},{UIS.InputBegan,"InputBegan"}}) do
+                local good,list=pcall(api.connections,pair[1])
+                local summary={total=0,foreign=0,accessible=0}
+                scan.signals[pair[2]]=summary
+                if good and type(list)=="table" then
+                    for i,c in ipairs(list) do
+                        summary.total=summary.total+1 if i>100 then summary.truncated=true break end
+                        local read,fn,foreign,on=pcall(function() return c.Function,c.ForeignState,c.Enabled end)
+                        if read and foreign then summary.foreign=summary.foreign+1 end
+                        if read and on~=false and type(fn)=="function" and not foreign and owned(fn) then
+                            summary.accessible=summary.accessible+1 add(fn,"signal",pair[2].."/"..i,true,false)
+                        end
+                        if not pause(32) then return end
+                    end
+                elseif not good then fail(pair[2],list) end
+            end
+        end
+        local function drain()
+            while head<=#queue and active() do
+                local entry=queue[head] head=head+1 scan.inspected=scan.inspected+1
+                if not inspect(entry) then return end
+                if not pause() then return end
+            end
+        end
+        drain()
+        if active() and scan.liveCandidates==0 and type(api.gc)=="function" then
+            local good,list=pcall(api.gc,false)
+            if good and type(list)=="table" then
+                scan.gcTotal=#list scan.gcVisited=0
+                for _,value in ipairs(list) do
+                    scan.gcVisited=scan.gcVisited+1
+                    if scan.gcVisited>12000 then scan.gcTruncated=true break end
+                    if type(value)=="function" and owned(value) then add(value,"gc-owner","gc/"..scan.gcVisited,true,false) end
+                    if not pause(64) then return end
+                end
+                list=nil drain()
+            elseif not good then fail("getgc",list) end
+        end
+    end)
+    if not ok then fail("scan",err) end
+    scan.status=not active() and "stopped" or (scan.liveCandidates>0 and "active_references_found" or (scan.metadataCandidates>0 and "metadata_only" or "no_accessible_fishing_function"))
+    scan.finishedAt=now()-d.started
+end
+
 stopDropDebug=function(shouldCopy)
     if not dropDebug or not dropDebug.running then return end
-    dropDebug.running=false dropDebug.seconds=now()-dropDebug.started
+    local d=dropDebug d.running=false d.seconds=now()-d.started
+    if d.scan and d.scan.status=="scanning" then d.scan.status="stopping" end
     if dropConnection then dropConnection:Disconnect() dropConnection=nil end
+    observeDropEvent=nil
+    local summary={casts=#d.cycles,caught=0,escaped=0}
+    for _,field in ipairs({"castToLand","castToBite","landToBite","biteToBar","castToCaught","recastGap"}) do
+        local count,sum,min,max=0,0,nil,nil
+        for _,entry in ipairs(d.cycles) do
+            local value=entry[field]
+            if type(value)=="number" then count=count+1 sum=sum+value min=not min and value or math.min(min,value) max=not max and value or math.max(max,value) end
+        end
+        if count>0 then summary[field]={n=count,mean=sum/count,min=min,max=max} end
+    end
+    for _,entry in ipairs(d.cycles) do if entry.caughtAt then summary.caught=summary.caught+1 end if entry.escapedAt then summary.escaped=summary.escaped+1 end end
+    d.summary=summary
     dropButton.Text="Debug queda (12 s)"
     if shouldCopy and copy then copy() end
 end
 startDropDebug=function()
     if not alive or (dropDebug and dropDebug.running) then return end
-    local d={running=true,started=now(),events={},parts={},readOnly=true}
+    local d={format="fishing-fall-debug-v2",running=true,started=now(),readOnly=true,events={},cycles={},parts={},
+        note="Metadados de copia de script nao sao funcao ativa. Aterrissagem estimada perto do ponto recebido no Cast; nao comprova limite do servidor."}
     dropDebug=d report.dropDebug=d dropButton.Text="Parar debug / copiar"
-    local physical={}
-    local function watch(obj)
-        if not obj:IsA("BasePart") then return end
-        for _,entry in ipairs(physical) do if entry.obj==obj then return end end
-        local parent=obj.Parent
-        local related=obj.Name:lower():find("bobber",1,true) or (parent and parent.Name:lower():find("bobber",1,true))
-        if not related or #physical>=6 then return end
-        local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-        if root and (obj.Position-root.Position).Magnitude>100 then return end
-        local data={path=obj:GetFullName(),class=obj.ClassName,samples={}}
-        physical[#physical+1]={obj=obj,data=data} d.parts[#d.parts+1]=data
+    local state={connections={},roots={},rootList={},rootId=0,current=nil,lastCaught=nil,lastSample=-math.huge}
+    local function active() return alive and d.running and dropDebug==d end
+    local function listen(signal,fn)
+        diagnosticOwn[fn]=true
+        state.connections[#state.connections+1]=signal:Connect(fn)
     end
-    local bobber=workspace:FindFirstChild("Bobber")
-    if bobber then watch(bobber) for _,obj in ipairs(bobber:GetDescendants()) do watch(obj) end end
-    dropConnection=workspace.DescendantAdded:Connect(function(obj) if d.running then watch(obj) end end)
-    task.spawn(function()
-        while alive and d.running and now()-d.started<12 do
-            for _,entry in ipairs(physical) do
-                if entry.obj.Parent and #entry.data.samples<125 then
-                    local p=entry.obj.Position
-                    entry.data.samples[#entry.data.samples+1]={t=now()-d.started,x=p.X,y=p.Y,z=p.Z}
+    dropConnection={Disconnect=function()
+        for _,c in ipairs(state.connections) do c:Disconnect() end
+        state.connections={} state.roots={} state.rootList={}
+    end}
+    local function attach(obj,preexisting)
+        local root=obj
+        for _=1,4 do
+            if not root or root==workspace then return end
+            if root.Name=="Bobber" and root.Parent==workspace then break end
+            root=root.Parent
+        end
+        if not root or root==workspace or root.Name~="Bobber" or root.Parent~=workspace then return end
+        local entry=state.roots[root]
+        if not entry then
+            if #state.rootList>=24 then d.rootLimit=true return end
+            state.rootId=state.rootId+1
+            entry={root=root,id=state.rootId,seenAt=now(),preexisting=preexisting==true}
+            state.roots[root]=entry state.rootList[#state.rootList+1]=entry
+        end
+        if obj:IsA("BasePart") and (obj.Name=="Ball" or not entry.ball) then entry.ball=obj end
+        local ball=root:FindFirstChild("Ball")
+        if ball and ball:IsA("BasePart") then entry.ball=ball end
+    end
+    for _,root in ipairs(workspace:GetChildren()) do
+        if root.Name=="Bobber" then attach(root,true) end
+    end
+    listen(workspace.DescendantAdded,function(obj) if active() then attach(obj,false) end end)
+    observeDropEvent=function(action,...)
+        if not active() then return end
+        local args=table.pack(...) local t=now()
+        if action=="Cast" then
+            if #d.cycles>=8 then d.cycleLimit=true state.current=nil return end
+            local target=args[1]
+            local row={index=#d.cycles+1,castAt=t,serverValue=safe(args[2],0,{left=3}),autoFlag=args[3]}
+            if typeof(target)=="Vector3" then row.target={x=target.X,y=target.Y,z=target.Z} end
+            if state.lastCaught then row.recastGap=t-state.lastCaught end
+            d.cycles[#d.cycles+1]=row state.current=row
+        elseif state.current then
+            local row=state.current
+            if action=="Bite" then
+                row.biteAt=t row.castToBite=t-row.castAt row.rarity=tostring(args[1])
+                if row.landedAt then row.landToBite=t-row.landedAt end
+            elseif action=="Caught" then
+                row.caughtAt=t row.castToCaught=t-row.castAt row.fish=tostring(args[1]) state.lastCaught=t
+            elseif action=="Escaped" then row.escapedAt=t end
+        end
+    end
+    listen(UIS.InputBegan,function(input,processed)
+        local row=state.current
+        if not active() or not row or not row.biteAt or row.hookInputAt or processed then return end
+        if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseButton1 then row.hookInputAt=now() row.biteToInput=row.hookInputAt-row.biteAt end
+    end)
+    listen(Run.RenderStepped,function()
+        if not active() then return end
+        local row=state.current if not row then return end
+        local shown,percent=progress()
+        local t=now()
+        if shown and not row.barAt then row.barAt=t if row.biteAt then row.biteToBar=t-row.biteAt end end
+        if shown and percent and percent>=99.95 and row.barAt and not row.fullAt then row.fullAt=t end
+        if not row.target or row.caughtAt or row.escapedAt then return end
+        for _,entry in ipairs(state.rootList) do
+            local ball=entry.ball
+            if not entry.preexisting and entry.seenAt>=row.castAt-.15 and not entry.owner and ball and ball.Parent and entry.root.Parent==workspace then
+                local p=ball.Position local target=row.target
+                local dx,dz=p.X-target.x,p.Z-target.z
+                local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+                local nearPlayer=not root or (p-root.Position).Magnitude<18
+                if nearPlayer or dx*dx+dz*dz<9 then
+                    entry.owner=row entry.data={id=entry.id,cycle=row.index,path=ball:GetFullName(),class=ball.ClassName,samples={},association="near_player_then_target"}
+                    d.parts[#d.parts+1]=entry.data
                 end
             end
-            task.wait(.1)
+            if entry.owner==row and ball and ball.Parent and entry.root.Parent==workspace then
+                local p=ball.Position local target=row.target local data=entry.data
+                if p.Y-target.y>.5 then
+                    data.sawAir=true
+                    if row.bobberId==entry.id and row.landedAt and not row.biteAt then
+                        -- Algumas criacoes comecam no alvo antes de iniciar o arco visual.
+                        row.landedAt=nil row.castToLand=nil row.bobberId=nil row.landToBite=nil
+                        data.earlyTargetDiscarded=true
+                    end
+                end
+                if t-(entry.sampleAt or -math.huge)>=.04 and #data.samples<24 and (not row.landedAt or t-row.landedAt<.15) then
+                    data.samples[#data.samples+1]={t=t-row.castAt,x=p.X,y=p.Y,z=p.Z} entry.sampleAt=t
+                end
+                local dx,dz=p.X-target.x,p.Z-target.z
+                if dx*dx+dz*dz<=1 and math.abs(p.Y-target.y)<=.3 then
+                    entry.contactAt=entry.contactAt or t
+                    if not row.landedAt and t-entry.contactAt>=.02 then
+                        row.landedAt=entry.contactAt row.castToLand=row.landedAt-row.castAt row.bobberId=entry.id
+                        data.association="reached_server_target"
+                        if row.biteAt then row.landToBite=row.biteAt-row.landedAt end
+                    end
+                else entry.contactAt=nil end
+            end
         end
-        if alive and d.running then stopDropDebug(true) end
+    end)
+    task.spawn(function() scanFallFunctions(d,active) end)
+    task.spawn(function()
+        while active() and now()-d.started<12 do task.wait(.1) end
+        if active() then stopDropDebug(true) end
     end)
 end
+
 local function resetCycle(reason)
     release()
     cycle=cycle+1 stage="idle" stateAt=os.clock() castAt=nil biteAt=nil hookAt=nil
@@ -358,6 +670,10 @@ end
 local function onServer(action,...)
     if not alive then return end
     if enabled or (dropDebug and dropDebug.running) then record("server",action,...) end
+    if observeDropEvent then
+        local ok,err=pcall(observeDropEvent,action,...)
+        if not ok and dropDebug then dropDebug.observationError=tostring(err) end
+    end
     if not enabled then return end
     local args=table.pack(...)
     if action=="Cast" then
@@ -416,6 +732,47 @@ copy=function()
             d.parts[#d.parts+1]={path=part.path,class=part.class,samples=samples}
         end
         export.dropDebug=d export.trimmed=true payload=Http:JSONEncode(export)
+    end
+    if #payload>18000 and export.dropDebug then
+        -- Prioriza tempos por ciclo e funcoes; nao repete o historico em dois campos.
+        local full=export.dropDebug local compact={}
+        for k,v in pairs(full) do if k~="events" and k~="parts" and k~="functions" then compact[k]=v end end
+        compact.parts={} compact.functions={}
+        for i,part in ipairs(full.parts or {}) do
+            if i>math.max(0,#full.parts-2) then
+                local samples={}
+                for n,sample in ipairs(part.samples or {}) do if n<=3 or n>#part.samples-3 then samples[#samples+1]=sample end end
+                compact.parts[#compact.parts+1]={id=part.id,cycle=part.cycle,path=part.path,class=part.class,association=part.association,samples=samples}
+            end
+        end
+        for i,fn in ipairs(full.functions or {}) do
+            if i>7 then break end
+            local row={} for k,v in pairs(fn) do if k~="constants" and k~="upvalues" then row[k]=v end end
+            row.constants={} row.upvalues={}
+            for n,v in ipairs(fn.constants or {}) do if n<=24 then row.constants[#row.constants+1]=v end end
+            for n,v in ipairs(fn.upvalues or {}) do if n<=6 then row.upvalues[#row.upvalues+1]=v end end
+            compact.functions[#compact.functions+1]=row
+        end
+        export.events=nil export.dropDebug=compact export.trimmed=true
+        payload=Http:JSONEncode(export)
+        while #payload>18000 and #compact.functions>2 do
+            table.remove(compact.functions) payload=Http:JSONEncode(export)
+        end
+        if #payload>18000 then
+            compact.parts={}
+            for _,fn in ipairs(compact.functions) do
+                local small={}
+                for n,value in ipairs(fn.upvalues or {}) do
+                    if n>3 then break end
+                    if value.fields then
+                        local fields={} for i,field in ipairs(value.fields) do if i<=2 then fields[#fields+1]=field end end
+                        small[#small+1]={index=value.index,fields=fields}
+                    else small[#small+1]=value end
+                end
+                fn.upvalues=small
+            end
+            payload=Http:JSONEncode(export)
+        end
     end
     env.FishingAutoTestReport=payload
     local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard
