@@ -39,12 +39,14 @@ local modeFault=false
 local autoOwned=false
 local manualAssisted=false
 local boundFunctions={}
+local observedFunctions={}
+local fingerprintCache=setmetatable({}, {__mode="k"})
 local dropDebug=nil
 local dropConnection=nil
 local startDropDebug,stopDropDebug
 local geometry={}
 local toggle,close,copy,setHeld,click,chooseMode
-local report={format="fishing-controller-v3-functions",placeId=game.PlaceId,
+local report={format="fishing-controller-v4-discovery",placeId=game.PlaceId,
     note="Chama funcoes locais, sem ponteiro virtual. Controla a barra real. Caught so conta no ciclo iniciado/controlado pelo auto. Nao comprova remocao dos tempos de queda/mordida.",
     caught=0,escaped=0,manualOrUnownedCaught=0,manualTouches=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,
     events={},catches={},inputErrors={},capabilities={},recastDelay=0}
@@ -123,36 +125,116 @@ local function constantsOf(fn)
     local ok,result=pcall(reader,fn)
     return ok and type(result)=="table" and result or {}
 end
-local function callbacks(signal,origin)
-    local list=getconnections or env.getconnections
-    if type(list)~="function" or not signal then return {} end
-    local ok,all=pcall(list,signal)
-    if not ok or type(all)~="table" then return {} end
-    local candidates,best={},0
-    for _,c in ipairs(all) do
-        local valid,fn,on,foreign=pcall(function() return c.Function,c.Enabled,c.ForeignState end)
-        if valid and type(fn)=="function" and not ownCallbacks[fn] and on~=false and foreign~=true then
-            local source=sourceOf(fn,c)
-            local lower=source:lower()
-            local score=(lower:find("playerscripts.client.main",1,true) and 100)
-                or (lower:find("playerscripts",1,true) and lower:find("fish",1,true) and 80)
-                or (lower:find("client.main",1,true) and 70) or 0
-            if score==0 then
-                -- Alguns executores nao expoem o caminho da closure. Usa a assinatura da pesca.
-                local hit,fish=false,false
-                for _,v in pairs(constantsOf(fn)) do
-                    if type(v)=="string" then
-                        if v=="Fishing" or v=="ReelBar" then fish=true end
-                        if v=="Cast" or v=="Hook" or v=="Catch" or v=="FishingRod" then hit=true end
+local function field(obj,key,errors)
+    local ok,value=pcall(function() return obj[key] end)
+    if not ok and errors then errors[key]=tostring(value):sub(1,110) end
+    if ok then return value end
+    return nil
+end
+local function fishingFingerprint(root)
+    local cached=fingerprintCache[root] if cached then return cached.score,cached.evidence end
+    local queue={{value=root,depth=0,label="fn"}}
+    local seen={} local index,budget,score=1,44,0
+    local evidence={}
+    local function hit(points,label)
+        score=math.max(score,points)
+        if #evidence<5 then evidence[#evidence+1]=label end
+    end
+    while index<=#queue and budget>0 and score<85 do
+        local item=queue[index] index=index+1
+        local v=item.value
+        if not seen[v] then
+            seen[v]=true budget=budget-1
+            if type(v)=="function" and not ownCallbacks[v] then
+                local fish,action=false,false
+                for _,x in pairs(constantsOf(v)) do
+                    if x=="Fishing" or x=="FishingRod" or x=="ReelBar" then fish=true end
+                    if x=="Cast" or x=="Hook" or x=="Catch" or x=="Bite" then action=true end
+                end
+                if fish and action then hit(85,item.label..": fishing actions")
+                elseif fish then hit(65,item.label..": fishing reference") end
+                if item.depth<3 and debug and type(debug.getupvalues)=="function" then
+                    local ok,values=pcall(debug.getupvalues,v)
+                    if ok and type(values)=="table" then
+                        local n=0
+                        for key,x in next,values do
+                            n=n+1 if n>32 or #queue>=80 then break end
+                            if type(key)=="string" and (key:lower():find("fish",1,true) or key:lower():find("reel",1,true)) then hit(65,item.label..":"..key) end
+                            if type(x)=="function" or type(x)=="table" or typeof(x)=="Instance" then
+                                queue[#queue+1]={value=x,depth=item.depth+1,label=item.label.."/uv"..tostring(key):sub(1,25)}
+                            end
+                        end
                     end
                 end
-                if fish and hit then score=60 end
+            elseif typeof(v)=="Instance" then
+                if v==fishing then hit(85,item.label..": Fishing remote")
+                else
+                    local name=v.Name:lower()
+                    if name=="reelbar" or name=="fishingrod" then hit(70,item.label..": "..v.Name) end
+                end
+            elseif type(v)=="table" and item.depth<3 and v~=_G and v~=env then
+                local n=0
+                for key,x in next,v do
+                    n=n+1 if n>32 or #queue>=80 then break end
+                    if key=="Fishing" or key=="ReelBar" or key=="FishingRod" then hit(65,item.label..":"..tostring(key)) end
+                    if type(x)=="function" or (type(x)=="table" and item.depth<2) or typeof(x)=="Instance" then
+                        queue[#queue+1]={value=x,depth=item.depth+1,label=item.label.."/"..tostring(key):sub(1,25)}
+                    end
+                end
             end
-            if score>0 then candidates[#candidates+1]={fn=fn,source=source,score=score,origin=origin} best=math.max(best,score) end
+        end
+    end
+    fingerprintCache[root]={score=score,evidence=evidence}
+    return score,evidence
+end
+local function callbacks(signal,origin)
+    local list=getconnections or env.getconnections
+    origin=origin or "unknown"
+    report.discovery=report.discovery or {}
+    local summary={total=0,accessible=0,selected=0,records={}}
+    report.discovery[origin]=summary
+    if type(list)~="function" or not signal then summary.error="getconnections/sinal indisponivel" return {} end
+    local ok,all=pcall(list,signal)
+    if not ok or type(all)~="table" then summary.error=tostring(all):sub(1,160) return {} end
+    local candidates,best={},0
+    for key,c in pairs(all) do
+        summary.total=summary.total+1
+        if summary.total>120 then summary.truncated=true break end
+        local errors={}
+        -- Campos opcionais NAO podem invalidar Function. Alguns executores lancam erro ao le-los.
+        local fn=type(c)=="function" and c or field(c,"Function",errors)
+        if type(fn)~="function" and type(c)~="function" then fn=field(c,"Callback",errors) end
+        local on,foreign
+        if type(c)~="function" then on=field(c,"Enabled",errors) foreign=field(c,"ForeignState",errors) end
+        local row={index=tostring(key),functionType=type(fn),enabled=on,foreign=foreign}
+        if next(errors) then row.fieldErrors=errors end
+        if type(fn)=="function" and not ownCallbacks[fn] and on~=false and foreign~=true then
+            summary.accessible=summary.accessible+1
+            local source=sourceOf(fn,type(c)=="function" and {} or c)
+            local lower=source:lower()
+            local score=(lower:find("playerscripts.client.main",1,true) and 100)
+                or (lower:find("playerscripts",1,true) and lower:find("fish",1,true) and 90)
+                or (lower:find("client.main",1,true) and 85) or 0
+            local evidence={}
+            if not lower:find("corepackages",1,true) and not lower:find("playermodule",1,true) then
+                local match,why=fishingFingerprint(fn)
+                if match>=60 then score=200+match evidence=why end
+            end
+            row.source=source:sub(1,180) row.score=score row.evidence=evidence
+            local entry={fn=fn,source=source,score=score,origin=origin,evidence=evidence}
+            observedFunctions[fn]=entry
+            if score>=60 then candidates[#candidates+1]=entry best=math.max(best,score) end
+        end
+        if #summary.records<8 then summary.records[#summary.records+1]=row
+        elseif row.score and row.score>=60 then
+            for i,old in ipairs(summary.records) do if not old.score or old.score<60 then summary.records[i]=row break end end
         end
     end
     local selected={}
-    for _,c in ipairs(candidates) do if c.score==best then selected[#selected+1]=c boundFunctions[c.fn]=c end end
+    for _,c in ipairs(candidates) do
+        if c.score==best then selected[#selected+1]=c boundFunctions[c.fn]=c end
+    end
+    summary.selected=#selected
     return selected
 end
 local function inputError(message)
@@ -354,13 +436,16 @@ startDropDebug=function()
         end
         return next(out) and out or nil
     end
-    boundFunctions={}
+    boundFunctions={} observedFunctions={}
     callbacks(UIS.InputBegan,"InputBegan")
     callbacks(UIS.InputEnded,"InputEnded")
     if tool then callbacks(tool.Activated,"Tool.Activated") callbacks(tool.Deactivated,"Tool.Deactivated") end
     local queue={}
     for fn,entry in pairs(boundFunctions) do queue[#queue+1]={fn=fn,origin=entry.origin or "Input",depth=0} end
     for _,entry in ipairs(callbacks(fishing.OnClientEvent,"Fishing.OnClientEvent")) do queue[#queue+1]={fn=entry.fn,origin=entry.origin,depth=0} end
+    for fn,entry in pairs(observedFunctions) do
+        if not boundFunctions[fn] and #queue<28 then queue[#queue+1]={fn=fn,origin=entry.origin.." / unclassified",depth=0} end
+    end
     task.spawn(function()
         local index=1
         while alive and d.running and index<=#queue and #d.functions<12 do
@@ -567,6 +652,19 @@ copy=function()
             local ev={} for i,event in ipairs(d.events) do if i<=5 or i>#d.events-5 then ev[#ev+1]=event end end d.events=ev
             payload=Http:JSONEncode(export)
         end
+    end
+    if #payload>18000 and export.events then
+        local recent={} for i,event in ipairs(export.events) do if i>#export.events-10 then recent[#recent+1]=event end end
+        export.events=recent export.trimmed=true payload=Http:JSONEncode(export)
+    end
+    if #payload>18000 and export.discovery then
+        local compact={}
+        for origin,data in pairs(export.discovery) do
+            local entry={total=data.total,accessible=data.accessible,selected=data.selected,error=data.error,records={}}
+            for i,row in ipairs(data.records or {}) do if i<=2 or (row.score and row.score>=60) then entry.records[#entry.records+1]=row end end
+            compact[origin]=entry
+        end
+        export.discovery=compact export.trimmed=true payload=Http:JSONEncode(export)
     end
     env.FishingAutoTestReport=payload
     local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard
