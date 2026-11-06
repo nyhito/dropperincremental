@@ -1,1025 +1,705 @@
--- Auto Fish mobile: clique rapido fora do minigame; segurar/soltar seguindo o peixe.
--- Entrada de tela virtual autorizada. Mantem o nome e a janela do teste.
--- A frequencia real depende dos frames; nao altera a barra nem promete queda instantanea.
+-- Dig / gamepass: detector de protocolo, faixa verde e proximo ponto.
+-- Nenhum clique/TP automatico. O teste visual e opcional e reversivel.
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
-local Http=game:GetService("HttpService")
-local UIS=game:GetService("UserInputService")
 local Run=game:GetService("RunService")
+local UIS=game:GetService("UserInputService")
+local Http=game:GetService("HttpService")
 local player=Players.LocalPlayer
 assert(player and game.PlaceId==70960300100792,"Execute no jogo configurado.")
 local env=(type(getgenv)=="function" and getgenv()) or _G
-for _,name in ipairs({"FishingDebug","FishingAutoTest"}) do
+for _,name in ipairs({"FishingDebug","FishingAutoTest","DigDebug"}) do
     if env[name] and type(env[name].Close)=="function" then pcall(env[name].Close) end
 end
-local fishing=RS:WaitForChild("Remotes"):FindFirstChild("Fishing")
-assert(fishing and fishing:IsA("RemoteEvent"),"Fishing indisponivel.")
-local alive,enabled=true,false
-local links={}
-local started=os.clock()
-local phase,stage="OFF","idle"
-local cycle,stateAt=0,os.clock()
-local rodCache,uiCache=nil,nil
-local castAt,biteAt,hookAt=nil,nil,nil
-local interval=0.001
-local lastClick,nextClick=-math.huge,0
-local castCheckAt,attemptsSinceCheck=0,0
-local pulse=nil
-local frameDuration=1/60
-local lastRecovery=-math.huge
-local hookAttempts=0
-local completionSent,held=false,false
-local inputEpoch,injecting=0,0
-local activeInput=nil
-local virtualInputAt=-math.huge
-local virtualX,virtualY=nil,nil
-local modes,modeIndex={},1
-local modeFault,inputWorking=false,false
-local autoOwned=false
-local geometry={}
-local dropDebug=nil
-local dropConnection=nil
-local dragging=false
-local autoButton=nil
-local toggle,close,copy,setHeld,click,chooseMode
-local startDropDebug,stopDropDebug
-local restoreMobile
-local mobileToken={}
-env.__NetoFishingMobileToken=mobileToken
-local mobileDevice=false
-pcall(function() mobileDevice=UIS.TouchEnabled==true end)
-local restoreGeneration=0
-local observeDropEvent=nil
-local diagnosticOwn=setmetatable({}, {__mode="k"})
-local report={format="fishing-controller-v9-reactive-mobile",placeId=game.PlaceId,
-    note="Conta Caught recebido enquanto ligado; nao distingue ajuda manual. Clica ate confirmar Cast, espera Bite e fisga. Barra acompanhada desde a abertura. Queda/mordida nao removidas.",
-    caught=0,escaped=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,recoveries=0,holdResyncs=0,
-    events={},catches={},inputErrors={},capabilities={},interval=interval}
-local function connect(signal,fn)
-    diagnosticOwn[fn]=true
-    local c=signal:Connect(fn) links[#links+1]=c return c
+local pg=player:WaitForChild("PlayerGui")
+local alive,running=true,false
+local generation=0
+local function current(token) return alive and running and generation==token end
+local started=0
+local links,sessionLinks={},{}
+local own=setmetatable({}, {__mode="k"})
+local report={format="dig-debug-v1",placeId=game.PlaceId}
+local refs={objects={}}
+local bound=setmetatable({}, {__mode="k"})
+local pendingButtons={}
+local monitored,remoteInfo={},{}
+local visual=nil
+local start,stop,copy,close,testZone
+local function at() return math.floor((os.clock()-started)*1000+.5)/1000 end
+local function listen(signal,fn,list)
+    own[fn]=true local c=signal:Connect(fn) local into=list or sessionLinks into[#into+1]=c return c
 end
-local function now() return math.floor((os.clock()-started)*1000+.5)/1000 end
-local function safe(v,depth,budget)
-    budget.left=budget.left-1
-    if budget.left<0 then return "[limit]" end
-    local kind=typeof(v)
-    if kind=="nil" then return {type="nil"} end
-    if kind=="string" then return v:sub(1,140) end
-    if kind=="boolean" then return v end
-    if kind=="number" then return v==v and v~=math.huge and v~=-math.huge and v or tostring(v) end
-    if kind=="Instance" then return {type=kind,path=v:GetFullName()} end
-    if kind=="Vector3" then return {type=kind,x=v.X,y=v.Y,z=v.Z} end
-    if kind=="table" and depth<2 then
-        local out,n={},0
-        for k,x in pairs(v) do n=n+1 if n>6 or budget.left<=0 then break end out[tostring(k)]=safe(x,depth+1,budget) end
-        return out
-    end
-    return {type=kind,value=tostring(v):sub(1,140)}
+local function disconnect(list) for _,c in ipairs(list) do c:Disconnect() end table.clear(list) end
+local function word(s)
+    s=tostring(s):lower()
+    for _,v in ipairs({"dig","detect","treasure","excavat","archaeo","hole","beach"}) do if s:find(v,1,true) then return true end end
+    return false
 end
-local function record(kind,action,...)
-    local e={t=now(),kind=kind,action=tostring(action):sub(1,90),cycle=cycle,stage=stage}
-    local args=table.pack(...)
-    if args.n>0 then e.args={} local b={left=18} for i=1,math.min(5,args.n) do e.args[tostring(i)]=safe(args[i],0,b) end end
-    if dropDebug and dropDebug.running and #dropDebug.events<36 then
-        if kind=="server" or tostring(action):find("Cast",1,true) or tostring(action):find("Hook",1,true) then
-            dropDebug.events[#dropDebug.events+1]=e
-        end
-    end
-    report.events[#report.events+1]=e
-    if #report.events>32 then table.remove(report.events,1) end
+local function stateWord(s)
+    s=tostring(s):lower()
+    if word(s) then return true end
+    for _,v in ipairs({"target","spot","green","zone","cursor","window","signal","layer","sweep","width","search"}) do if s:find(v,1,true) then return true end end
+    return false
 end
-local function rod()
-    local c=player.Character
-    if not c then return end
-    local h=c:FindFirstChild("Humanoid") if h and h.Health<=0 then return end
-    if rodCache and rodCache.Parent==c then return rodCache end
-    local t=c:FindFirstChild("FishingRod")
-    rodCache=t and t.Parent==c and t:IsA("Tool") and t or nil
-    return rodCache
-end
-local function reelBar()
-    if uiCache and uiCache.Parent then return uiCache end
-    local pg=player:FindFirstChild("PlayerGui")
-    local front=pg and pg:FindFirstChild("Front")
-    local main=front and front:FindFirstChild("MainFrame")
-    uiCache=main and main:FindFirstChild("ReelBar")
-    return uiCache
-end
-local function progress()
-    local bar=reelBar()
-    local text=bar and bar:FindFirstChild("Percent")
-    local value=text and tonumber(((text.Text:match("[%d.,]+") or ""):gsub(",",".")))
-    return bar and bar.Visible or false,value
-end
-local clickPoint={x=nil,y=nil,at=-math.huge,vx=0,vy=0}
-local pointBlocked=false
-local function pointIsFree(x,y)
-    local pg=player:FindFirstChild("PlayerGui")
-    if not pg then return false end
-    local ok,hits=pcall(function() return pg:GetGuiObjectsAtPosition(x,y) end)
-    if not ok or type(hits)~="table" then return true end
-    for _,obj in ipairs(hits) do
-        local a=obj
-        for _=1,10 do
-            if not a or a==pg then break end
-            if a:IsA("GuiButton") or a:IsA("TextBox") then return false end
-            if a.Name=="FishingControllerTest" then return false end
-            a=a.Parent
-        end
-    end
-    return true
-end
+local function path(obj) local ok,s=pcall(function() return obj:GetFullName() end) return ok and s or "[removed]" end
 local function position()
-    local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
-    if os.clock()-clickPoint.at<.35 and view.X==clickPoint.vx and view.Y==clickPoint.vy then
-        return clickPoint.x,clickPoint.y
-    end
-    clickPoint.at=os.clock() clickPoint.vx=view.X clickPoint.vy=view.Y
-    clickPoint.x,clickPoint.y=nil,nil
-    for _,point in ipairs({{.78,.30},{.65,.36},{.53,.34},{.42,.38},{.78,.47},{.6,.48},{.52,.21},{.42,.23}}) do
-        local x,y=math.floor(view.X*point[1]),math.floor(view.Y*point[2])
-        if pointIsFree(x,y) then clickPoint.x=x clickPoint.y=y break end
-    end
-    return clickPoint.x,clickPoint.y
+    local c=player.Character local r=c and c:FindFirstChild("HumanoidRootPart") return r and r.Position
 end
-local function inputError(message)
-    modeFault=true
-    report.inputErrors[#report.inputErrors+1]={t=now(),mode=modes[modeIndex] and modes[modeIndex].name,error=tostring(message):sub(1,230)}
-    if #report.inputErrors>6 then table.remove(report.inputErrors,1) end
-end
-local function refreshModes()
-    modes={} modeIndex=1 modeFault=false
-    local virtual
-    pcall(function() virtual=game:GetService("VirtualInputManager") end)
-    if virtual then
-        modes[#modes+1]={name="VirtualInput / clique na tela",press=function(down)
-            local point=activeInput
-            if not point then return end
-            virtualInputAt=os.clock() virtualX=point.x virtualY=point.y
-            virtual:SendMouseButtonEvent(point.x,point.y,0,down,game,0)
-        end}
+local function vec(v) return {x=v.X,y=v.Y,z=v.Z} end
+local function short(v,depth,budget)
+    budget.left=budget.left-1 if budget.left<0 then return "[limit]" end
+    local kind=typeof(v)
+    if kind=="nil" then return {type="nil"}
+    elseif kind=="string" then return v:sub(1,100)
+    elseif kind=="number" then return v==v and math.abs(v)~=math.huge and v or tostring(v)
+    elseif kind=="boolean" then return v
+    elseif kind=="Vector3" then local r=vec(v) r.type=kind return r
+    elseif kind=="CFrame" then local r=vec(v.Position) r.type=kind return r
+    elseif kind=="Vector2" then return {type=kind,x=v.X,y=v.Y}
+    elseif kind=="UDim2" then return {type=kind,xScale=v.X.Scale,xOffset=v.X.Offset,yScale=v.Y.Scale,yOffset=v.Y.Offset}
+    elseif kind=="Instance" then return {type=kind,path=path(v),class=v.ClassName}
+    elseif type(v)=="table" and depth<2 then
+        local r,n={},0 for k,x in next,v do n=n+1 if n>8 or budget.left<=0 then break end r[tostring(k)]=short(x,depth+1,budget) end return r
     end
-    local press=mouse1press or env.mouse1press
-    local unpress=mouse1release or env.mouse1release
-    if type(press)=="function" and type(unpress)=="function" then
-        modes[#modes+1]={name="Executor / pressionar e soltar",press=function(down)
-            virtualInputAt=os.clock()
-            if down then press() else unpress() end
-        end}
-    end
-    report.capabilities={screenInput=true,virtualInput=virtual~=nil,executorMouse=type(press)=="function" and type(unpress)=="function",inputModes=#modes}
+    return {type=kind}
 end
-setHeld=function(down,force)
-    if down and (not alive or not enabled) then return false end
-    if held==down and not force then return true end
-    local mode=modes[modeIndex]
-    if not mode then return false end
-    if down then
-        local x,y=position()
-        if not x then pointBlocked=true return false end
-        pointBlocked=false activeInput={x=x,y=y}
+local function add(list,value,max) list[#list+1]=value if #list>max then table.remove(list,1) end end
+local function shown(obj)
+    local p=obj
+    for _=1,18 do
+        if not p then return false end
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") then return p.Enabled end
+        p=p.Parent
     end
-    -- Marca antes do evento: Cast/Hook podem retornar durante o proprio callback.
-    held=down
-    injecting=injecting+1
-    local ok,err=pcall(mode.press,down)
-    injecting=injecting-1
-    if not ok then
-        held=false
-        if down then pcall(mode.press,false) end
-        inputError(err) return false
-    end
-    report.holdChanges=report.holdChanges+1 report.inputMode=mode.name
-    if not down then activeInput=nil end
-    return true
+    return false
 end
-local function release(force)
-    inputEpoch=inputEpoch+1
-    pulse=nil
-    if force and not activeInput then
-        local x,y=virtualX,virtualY
-        if not x then x,y=position() end
-        if x then activeInput={x=x,y=y} end
-    end
-    if held or (force and activeInput) then setHeld(false,true) end
-    held=false activeInput=nil
-end
-chooseMode=function(reason)
-    -- Troca somente depois de erro real da API, nunca por demora do servidor ou borda da barra.
-    release(true) record("input","Switch",reason)
-    modeIndex=modeIndex+1
-    if modeIndex>#modes then
-        enabled=false phase="Clique virtual indisponivel. Copie o resultado."
-        if autoButton then autoButton.Text="Auto Fish: OFF" end
-        if restoreMobile then restoreMobile() end
-        return false
-    end
-    modeFault=false inputWorking=false castCheckAt=os.clock() attemptsSinceCheck=0
-    report.inputMode=modes[modeIndex].name
-    return true
-end
-click=function(reason)
-    if not alive or not enabled then return false end
-    local shown=progress()
-    if shown then return false end -- Nunca mistura spam com o controle da barra.
-    local x=position()
-    if not x then release() phase="Ponto de clique coberto pela interface" return false end
-    if pulse or held then return false end
-    lastClick=os.clock() nextClick=lastClick+interval
-    local epoch=inputEpoch
-    if not setHeld(true) then return false end
-    report.clicks=report.clicks+1 attemptsSinceCheck=attemptsSinceCheck+1
-    if stage=="hooking" then hookAttempts=hookAttempts+1 nextClick=lastClick+math.max(interval,.18) end
-    if reason then record("input",reason) end
-    -- Um frame pressionado e outro solto. Evita que o mobile junte os dois estados.
-    -- A soltura e processada no RenderStepped, sem tasks atrasadas de cliques antigos.
-    if enabled and epoch==inputEpoch then pulse={releaseAt=os.clock()+.008,epoch=epoch} end
-    return true
-end
--- Painel de teste independente: ligado/desligado, intervalo e resultado para retorno.
-local gui=Instance.new("ScreenGui") gui.Name="FishingControllerTest" gui.ResetOnSpawn=false gui.DisplayOrder=10031
- gui.Parent=player:WaitForChild("PlayerGui")
-local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(312,262) panel.Position=UDim2.new(0,12,0.15,0)
- panel.BackgroundColor3=Color3.fromRGB(21,23,30) panel.Parent=gui
+local gui=Instance.new("ScreenGui") gui.Name="NetoDigDebug" gui.ResetOnSpawn=false gui.DisplayOrder=10032 gui.Parent=pg
+local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(330,265) panel.Position=UDim2.new(0,12,.16,0)
+panel.BackgroundColor3=Color3.fromRGB(21,23,30) panel.Parent=gui
 Instance.new("UICorner",panel).CornerRadius=UDim.new(0,9)
 local function button(text,x,y,w,h)
-    local b=Instance.new("TextButton") b.Text=text b.Font=Enum.Font.Gotham b.TextSize=13
-    b.TextColor3=Color3.new(1,1,1) b.BackgroundColor3=Color3.fromRGB(66,49,110)
-    b.Position=UDim2.fromOffset(x,y) b.Size=UDim2.fromOffset(w,h) b.Parent=panel
+    local b=Instance.new("TextButton") b.Text=text b.Font=Enum.Font.Gotham b.TextSize=13 b.TextColor3=Color3.new(1,1,1)
+    b.BackgroundColor3=Color3.fromRGB(66,49,110) b.Position=UDim2.fromOffset(x,y) b.Size=UDim2.fromOffset(w,h) b.Parent=panel
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,6) return b
 end
-local title=Instance.new("TextLabel") title.Text="AUTO FISH / CLIQUE RAPIDO" title.Font=Enum.Font.GothamBold title.TextSize=13
- title.TextColor3=Color3.new(1,1,1) title.BackgroundTransparency=1 title.Active=true
- title.Position=UDim2.fromOffset(10,3) title.Size=UDim2.fromOffset(224,30) title.Parent=panel
-local minimize=button("-",242,6,26,26) local exit=button("X",276,6,26,26)
-autoButton=button("Auto Fish: OFF",10,42,292,36)
-local intervalLabel=Instance.new("TextLabel") intervalLabel.Text="Intervalo dos cliques (s)" intervalLabel.Font=Enum.Font.Gotham intervalLabel.TextSize=12
- intervalLabel.TextColor3=Color3.new(1,1,1) intervalLabel.BackgroundTransparency=1
- intervalLabel.Position=UDim2.fromOffset(10,85) intervalLabel.Size=UDim2.fromOffset(190,30) intervalLabel.Parent=panel
-local intervalBox=Instance.new("TextBox") intervalBox.Text="0.001" intervalBox.ClearTextOnFocus=false intervalBox.Font=Enum.Font.Code intervalBox.TextSize=13
- intervalBox.TextColor3=Color3.new(1,1,1) intervalBox.BackgroundColor3=Color3.fromRGB(35,37,46)
- intervalBox.Position=UDim2.fromOffset(206,85) intervalBox.Size=UDim2.fromOffset(96,30) intervalBox.Parent=panel
-local copyButton=button("Copiar resultado",10,123,292,31)
-local dropButton=button("Debug queda (12 s)",10,161,292,31)
-local label=Instance.new("TextLabel") label.Text="Chegue perto do lago e ative."
- label.TextWrapped=true label.TextXAlignment=Enum.TextXAlignment.Left label.TextYAlignment=Enum.TextYAlignment.Top
- label.Font=Enum.Font.Gotham label.TextSize=12 label.TextColor3=Color3.new(1,1,1) label.BackgroundTransparency=1
- label.Position=UDim2.fromOffset(10,200) label.Size=UDim2.fromOffset(292,53) label.Parent=panel
-local mini=Instance.new("TextButton") mini.Text="PESCA" mini.Font=Enum.Font.GothamBold mini.TextSize=12
- mini.TextColor3=Color3.new(1,1,1) mini.BackgroundColor3=Color3.fromRGB(66,49,110)
- mini.Position=panel.Position mini.Size=UDim2.fromOffset(70,38) mini.Visible=false mini.Parent=gui
-Instance.new("UICorner",mini).CornerRadius=UDim.new(0,8)
+local title=Instance.new("TextLabel") title.Text="DEBUG DIG / GAMEPASS" title.Font=Enum.Font.GothamBold title.TextSize=13
+title.TextColor3=Color3.new(1,1,1) title.BackgroundTransparency=1 title.Active=true
+title.Position=UDim2.fromOffset(10,3) title.Size=UDim2.fromOffset(230,30) title.Parent=panel
+local minimize=button("-",260,6,25,25) local exit=button("X",292,6,25,25)
+local startButton=button("Iniciar debug (30 s)",10,42,310,34)
+local stopButton=button("Parar / copiar",10,84,150,32) local copyButton=button("Copiar resultado",170,84,150,32)
+local testButton=button("Testar faixa verde: OFF",10,125,310,34)
+local label=Instance.new("TextLabel") label.Text="Ligue a gamepass e inicie antes de achar um ponto."
+label.TextWrapped=true label.TextXAlignment=Enum.TextXAlignment.Left label.TextYAlignment=Enum.TextYAlignment.Top
+label.Font=Enum.Font.Gotham label.TextSize=12 label.TextColor3=Color3.new(1,1,1) label.BackgroundTransparency=1
+label.Position=UDim2.fromOffset(10,171) label.Size=UDim2.fromOffset(310,82) label.Parent=panel
+local mini=Instance.new("TextButton") mini.Text="DIG" mini.Font=Enum.Font.GothamBold mini.TextSize=12 mini.TextColor3=Color3.new(1,1,1)
+mini.BackgroundColor3=Color3.fromRGB(66,49,110) mini.Position=panel.Position mini.Size=UDim2.fromOffset(60,36) mini.Visible=false mini.Parent=gui
 local output=Instance.new("TextBox") output.Text="" output.MultiLine=true output.TextWrapped=true output.ClearTextOnFocus=false
- output.Font=Enum.Font.Code output.TextSize=10 output.TextColor3=Color3.new(1,1,1) output.BackgroundColor3=Color3.fromRGB(29,31,39)
- output.TextXAlignment=Enum.TextXAlignment.Left output.TextYAlignment=Enum.TextYAlignment.Top
- output.Position=UDim2.fromOffset(0,268) output.Size=UDim2.fromOffset(312,135) output.Visible=false output.Parent=panel
--- Diagnostico da queda: leitura local, sem alterar constantes, funcoes ou posicoes.
-local function scanFallFunctions(d,active)
-    local dbg=debug or {}
-    local api={constants=dbg.getconstants or env.getconstants,upvalues=dbg.getupvalues or env.getupvalues,
-        protos=dbg.getprotos or env.getprotos,proto=dbg.getproto or env.getproto,
-        closure=getscriptclosure or env.getscriptclosure,senv=getsenv or env.getsenv,
-        gc=getgc or env.getgc,connections=getconnections or env.getconnections,
-        executor=isexecutorclosure or env.isexecutorclosure}
-    d.capabilities={}
-    for k,fn in pairs(api) do d.capabilities[k]=type(fn)=="function" end
-    local scripts=player:FindFirstChild("PlayerScripts")
-    local client=scripts and scripts:FindFirstChild("Client")
-    local mainScript=client and client:FindFirstChild("Main")
-    local components=client and client:FindFirstChild("Components")
-    local ui=components and components:FindFirstChild("UI")
-    local world=ui and ui:FindFirstChild("World")
-    local fishingComponent=world and world:FindFirstChild("Fishing")
-    local main=fishingComponent or mainScript
-    d.script=main and main:GetFullName() or nil
-    d.mainScript=mainScript and mainScript:GetFullName() or nil
-    d.targetComponent=fishingComponent~=nil
-    local scan={status="scanning",inspected=0,queued=0,liveCandidates=0,metadataCandidates=0,liveBobberCandidates=0,metadataBobberCandidates=0,errors={},signals={}}
-    d.scan=scan d.functions={}
-    local queue,seen={},setmetatable({}, {__mode="k"})
-    local head,ops,workAt=1,0,os.clock()
-    local function pause(limit)
-        ops=ops+1
-        if ops>=(limit or 4) or os.clock()-workAt>.0015 then task.wait(.025) ops=0 workAt=os.clock() end
-        return active()
-    end
-    local function fail(where,err)
-        if #scan.errors<8 then scan.errors[#scan.errors+1]={where=where,error=tostring(err):sub(1,160)} end
-    end
-    local function related(value)
-        local s=tostring(value):lower()
-        for _,word in ipairs({"fish","rod","bobber","bait","cast","reel","bite","hook","tween","lerp","duration","delay","travel","flight","gravity","velocity","fall","animation","holding","held","input","state","depth"}) do
-            if s:find(word,1,true) then return true end
+output.Font=Enum.Font.Code output.TextSize=10 output.TextColor3=Color3.new(1,1,1) output.BackgroundColor3=Color3.fromRGB(29,31,39)
+output.TextXAlignment=Enum.TextXAlignment.Left output.TextYAlignment=Enum.TextYAlignment.Top
+output.Position=UDim2.fromOffset(0,272) output.Size=UDim2.fromOffset(330,135) output.Visible=false output.Parent=panel
+
+-- Captura pequena. Nunca chama metodos de Instance/JSON dentro do namecall.
+local probe=env.__NetoDigProbe
+if type(probe)~="table" then probe={installed=false,enabled=false} env.__NetoDigProbe=probe end
+local function rawClone(v,depth,budget)
+    budget.left=budget.left-1 if budget.left<0 then return "[limit]" end
+    if type(v)~="table" then return v end
+    if depth>=2 then return "[table]" end
+    local t,n={},0
+    for k,x in next,v do n=n+1 if n>8 or budget.left<=0 then break end t[k]=rawClone(x,depth+1,budget) end
+    return t
+end
+local function enqueue(kind,obj,method,...)
+    if not running then return end
+    if probe.tail-probe.head>=160 then report.dropped=report.dropped+1 return end
+    local values=table.pack(...) local copied={n=math.min(values.n,6)} local budget={left=24}
+    for i=1,copied.n do copied[i]=rawClone(values[i],0,budget) end
+    probe.tail=probe.tail+1 probe.queue[probe.tail]={kind=kind,obj=obj,method=method,args=copied,time=os.clock()}
+end
+local function installProbe()
+    if probe.installed then return true end
+    local hook=hookmetamethod or env.hookmetamethod local namecall=getnamecallmethod or env.getnamecallmethod
+    if type(hook)~="function" or type(namecall)~="function" then return false,"hookmetamethod/getnamecallmethod indisponiveis" end
+    local original
+    local wrapper=function(self,...)
+        if probe.enabled and probe.allowed[self] then
+            local method=namecall()
+            if method=="FireServer" or method=="InvokeServer" then
+                probe.seen[self]=true
+                if probe.tail-probe.head<160 then
+                    local args=table.pack(...) local values={n=math.min(args.n,6)} local budget={left=24}
+                    for i=1,values.n do values[i]=rawClone(args[i],0,budget) end
+                    probe.tail=probe.tail+1 probe.queue[probe.tail]={kind="send",obj=self,method=method,args=values,time=os.clock()}
+                else probe.dropped=probe.dropped+1 end
+            end
         end
-        return false
+        return original(self,...)
     end
-    local function info(fn)
-        local src,name="",""
-        if dbg.info then pcall(function() src,name=dbg.info(fn,"sn") end)
-        elseif dbg.getinfo then pcall(function() local i=dbg.getinfo(fn,"Sn") src=i.source name=i.name end) end
-        if type(getfenv)=="function" then pcall(function()
-            local scope=getfenv(fn) local script=type(scope)=="table" and rawget(scope,"script")
-            if typeof(script)=="Instance" then src=script:GetFullName() end
-        end) end
-        return tostring(src or ""),tostring(name or "")
+    local native=newcclosure or env.newcclosure
+    if type(native)=="function" then wrapper=native(wrapper) end
+    local ok,result=pcall(hook,game,"__namecall",wrapper)
+    if not ok then return false,tostring(result) end
+    original=result probe.installed=true return true
+end
+local function attributes(obj)
+    local r,n={},0 local ok,a=pcall(function() return obj:GetAttributes() end)
+    if ok then for k,v in pairs(a) do n=n+1 if n>8 then break end r[k]=short(v,0,{left=8}) end end
+    return r
+end
+local function snapshot(obj)
+    local r={path=path(obj),class=obj.ClassName,name=obj.Name,attributes=attributes(obj)}
+    if obj:IsA("GuiObject") then r.position=short(obj.Position,0,{left=4}) r.size=short(obj.Size,0,{left=4}) r.visible=shown(obj)
+        r.absolute={x=obj.AbsolutePosition.X,y=obj.AbsolutePosition.Y,w=obj.AbsoluteSize.X,h=obj.AbsoluteSize.Y} end
+    if obj:IsA("TextLabel") or obj:IsA("TextButton") then r.text=obj.Text:sub(1,130) end
+    if obj:IsA("BasePart") then r.position=vec(obj.Position) r.size=vec(obj.Size) end
+    return r
+end
+local function isText(obj) return obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") end
+local function clean(s) return tostring(s):gsub("<[^>]+>",""):lower():gsub("%s+", " "):match("^%s*(.-)%s*$") end
+local function caption(obj)
+    if obj:IsA("TextButton") then return clean(obj.Text) end
+    for i,x in ipairs(obj:GetDescendants()) do
+        if i>16 then break end
+        if isText(x) then local text=clean(x.Text) if text=="dig" or text=="find the spot" then return text end end
+    end
+    return ""
+end
+local function hudFor(obj)
+    local p=obj.Parent local fallback=p
+    for _=1,4 do
+        if not p or p==pg or p:IsA("ScreenGui") then break end
+        for i,x in ipairs(p:GetDescendants()) do
+            if i>150 then break end
+            if isText(x) then local s=clean(x.Text) if s:find("signal",1,true) or s:find("digging",1,true) or s:find("green zone",1,true) or s:find("searching the beach",1,true) then return p end end
+        end
+        p=p.Parent
+    end
+    return fallback
+end
+local function refreshObjects()
+    refs.objects={}
+    if refs.hud and refs.hud.Parent then for i,obj in ipairs(refs.hud:GetDescendants()) do if i>180 then break end refs.objects[#refs.objects+1]=obj end end
+end
+local function geometry()
+    local track,zone,marker=refs.track,refs.zone,refs.marker
+    if not track or not zone or not marker or not zone.Parent or not marker.Parent or track.AbsoluteSize.X<=0 then return nil end
+    local left,w=track.AbsolutePosition.X,track.AbsoluteSize.X
+    local cursor=(marker.AbsolutePosition.X+marker.AbsoluteSize.X*.5-left)/w
+    local lo=(zone.AbsolutePosition.X-left)/w local width=zone.AbsoluteSize.X/w
+    local r={cursor=cursor,greenStart=lo,greenWidth=width,inside=cursor>=lo and cursor<=lo+width}
+    if visual then r.insideOriginal=cursor>=visual.originalStart and cursor<=visual.originalStart+visual.originalWidth r.visualTest=true end
+    return r
+end
+local function findGeometry()
+    if visual then return end
+    local best=nil
+    for _,zone in ipairs(refs.objects) do
+        if zone:IsA("Frame") or zone:IsA("ImageLabel") or zone:IsA("CanvasGroup") then
+            local c=zone.BackgroundColor3 local parent=zone.Parent local size=zone.AbsoluteSize
+            if zone:IsA("ImageLabel") then local tint=zone.ImageColor3 if tint and tint.G>.4 and tint.G>tint.R*1.15 and tint.G>tint.B*1.1 then c=tint end end
+            if parent and parent:IsA("GuiObject") and parent.AbsoluteSize.X>60 and size.X>15 and size.Y>5
+                and size.X<parent.AbsoluteSize.X*.9 and size.Y<parent.AbsoluteSize.Y*1.6
+                and c.G>.4 and c.G>c.R*1.15 and c.G>c.B*1.1 then
+                local marker,score=nil,0
+                for i,obj in ipairs(parent:GetDescendants()) do
+                    if i>45 then break end
+                    if obj~=zone and not obj:IsDescendantOf(zone) and obj:IsA("GuiObject") then
+                        local s=obj.AbsoluteSize local color=obj.BackgroundColor3
+                        if s.X>0 and s.X<parent.AbsoluteSize.X*.1 and s.Y>=size.Y*.65 then
+                            local n=obj.Name:lower() local rank=(color.R>.65 and color.G>.65 and color.B>.65) and 5 or 0
+                            if n:find("cursor",1,true) or n:find("needle",1,true) or n:find("indicator",1,true) or n:find("line",1,true) then rank=rank+10 end
+                            if rank>score then score=rank marker=obj end
+                        end
+                    end
+                end
+                if marker and (not best or score>best.score) then best={zone=zone,track=parent,marker=marker,score=score} end
+            end
+        end
+    end
+    if best then refs.zone=best.zone refs.track=best.track refs.marker=best.marker
+        report.geometry={zone=snapshot(best.zone),track=snapshot(best.track),marker=snapshot(best.marker),confidence="paired_green_and_cursor"} end
+end
+local function readHud()
+    local texts={} local phase="unknown" local signal=nil local layer=nil
+    for _,obj in ipairs(refs.objects) do
+        if isText(obj) and shown(obj) then
+            local s=clean(obj.Text)
+            if s:find("digging",1,true) or s:find("hit the green zone",1,true) or s:find("try the next sweep",1,true) then phase="digging" end
+            if s:find("signal",1,true) then signal=tonumber(s:match("([%d.]+)%%")) if phase~="digging" then phase="signal" end end
+            if s:find("searching the beach",1,true) and phase=="unknown" then phase="searching" end
+            if s:find("layer",1,true) then layer=s:match("(%d+%s*/%s*%d+)") or layer end
+            if #s>0 and (s=="dig" or s:find("signal",1,true) or s:find("layer",1,true) or s:find("miss",1,true) or s:find("search",1,true)) and #texts<8 then texts[#texts+1]={path=path(obj),text=obj.Text:sub(1,110)} end
+        end
+    end
+    return phase,signal,layer,texts
+end
+local lastTap=-math.huge
+local function bindButton(obj)
+    if not obj:IsA("GuiButton") or obj:IsDescendantOf(gui) or bound[obj] then return end
+    local text=caption(obj)
+    if text~="dig" and text~="find the spot" and not obj.Name:lower():find("digbutton",1,true) then return end
+    bound[obj]=true local token=generation
+    if not refs.button or not shown(refs.button) or shown(obj) then
+        refs.button=obj refs.hud=hudFor(obj) refreshObjects()
+        report.button=snapshot(obj) report.hud=refs.hud and path(refs.hud)
+    end
+    local function tapped()
+        if not current(token) or os.clock()-lastTap<.05 then return end
+        if refs.button~=obj then refs.button=obj refs.hud=hudFor(obj) refreshObjects() findGeometry() end
+        lastTap=os.clock()
+        local phase,signal,layer=readHud()
+        local data={t=at(),phase=phase,signal=signal,layer=layer,geometry=geometry(),button=path(obj),visualTest=visual~=nil}
+        local p=position() if p then data.player=vec(p) end
+        add(report.taps,data,16)
+        if visual then visual.record.taps=visual.record.taps+1
+            if data.geometry and data.geometry.insideOriginal==false then visual.record.outsideOriginalTaps=visual.record.outsideOriginalTaps+1 end end
+    end
+    listen(obj.Activated,tapped)
+    if obj.MouseButton1Click then listen(obj.MouseButton1Click,tapped) end
+end
+local function discoverUi(token)
+    local front=pg:FindFirstChild("Front") local main=front and front:FindFirstChild("MainFrame")
+    local function scan(root)
+        for i,obj in ipairs(root:GetDescendants()) do
+            if not current(token) then return end
+            if obj:IsA("GuiButton") and not obj:IsDescendantOf(gui) then
+                if #pendingButtons<320 then pendingButtons[#pendingButtons+1]=obj end
+                bindButton(obj)
+            end
+            if i%80==0 then task.wait(.025) end
+        end
+    end
+    if main then scan(main) end
+    if current(token) and not refs.button then scan(pg) end
+    if current(token) and refs.button then findGeometry() end
+end
+local targetKeys={}
+local function candidate(v,source,kind)
+    if typeof(v)~="Vector3" then return end
+    local p=position() if p and (v-p).Magnitude>500 then return end
+    local key=string.format("%.2f/%.2f/%.2f",v.X,v.Y,v.Z)
+    local entry=targetKeys[key]
+    if not entry then
+        if #report.targets>=12 then report.targetLimit=true return end
+        entry={position=vec(v),firstSeen=at(),source=source,kind=kind or "candidate_not_validated",startDistance=p and (v-p).Magnitude}
+        targetKeys[key]=entry report.targets[#report.targets+1]=entry
+    end
+    entry.lastSeen=at()
+end
+local function vectorLeaves(value,source,depth,budget)
+    budget.left=budget.left-1 if budget.left<0 then return end
+    if typeof(value)=="Vector3" then candidate(value,source)
+    elseif typeof(value)=="CFrame" then candidate(value.Position,source.."/CFrame")
+    elseif type(value)=="table" and depth<2 then
+        local n=0 for key,v in next,value do n=n+1 if n>20 or budget.left<=0 then break end vectorLeaves(v,source.."/"..tostring(key),depth+1,budget) end
+    end
+end
+local function inspectWorld(token)
+    local features=workspace:FindFirstChild("Features")
+    if features then
+        for _,root in ipairs(features:GetChildren()) do
+            if not current(token) then return end
+            if word(root.Name) and #report.world<5 then
+                local row={path=path(root),attributes=attributes(root),parts={}}
+                report.world[#report.world+1]=row
+                vectorLeaves(root:GetAttributes(),row.path.."/attributes",0,{left=24})
+                for i,obj in ipairs(root:GetDescendants()) do
+                    if not current(token) then return end
+                    if i>240 then row.truncated=true break end
+                    if obj:IsA("BasePart") and #row.parts<8 and (stateWord(obj.Name) or #row.parts<3) then
+                        row.parts[#row.parts+1]=snapshot(obj)
+                        vectorLeaves(obj:GetAttributes(),path(obj).."/attributes",0,{left=16})
+                    end
+                    if i%60==0 then task.wait(.025) end
+                end
+            end
+        end
+    end
+    local character=player.Character
+    if character then for _,obj in ipairs(character:GetChildren()) do if obj:IsA("Tool") then report.tools[#report.tools+1]={name=obj.Name,attributes=attributes(obj)} end end end
+end
+local groupKeys={}
+local function drain()
+    local count=0
+    while probe.head<=probe.tail and count<80 do
+        local row=probe.queue[probe.head] probe.queue[probe.head]=nil probe.head=probe.head+1 count=count+1
+        local info=remoteInfo[row.obj]
+        if info then
+            local args={}
+            for i=1,row.args.n do args[tostring(i)]=short(row.args[i],0,{left=25}) vectorLeaves(row.args[i],info.path.."/"..row.kind.."/arg"..i,0,{left=30}) end
+            local encoded=Http:JSONEncode(args)
+            local action=type(row.args[1])=="string" and row.args[1]:sub(1,40) or ""
+            local key=row.kind..info.path..row.method..action
+            local group=groupKeys[key]
+            if not group and #report.calls<22 then
+                group={kind=row.kind,path=info.path,class=info.class,related=info.related,method=row.method,action=action,count=0,first=row.time-started,variants={}}
+                groupKeys[key]=group report.calls[#report.calls+1]=group
+            end
+            if group then
+                group.count=group.count+1 group.last=row.time-started
+                local found=false
+                for _,variant in ipairs(group.variants) do if variant.signature==encoded then variant.count=variant.count+1 variant.last=row.time-started found=true break end end
+                if not found then
+                    if #group.variants<3 then group.variants[#group.variants+1]={signature=encoded,args=args,argCount=row.args.n,count=1,first=row.time-started,last=row.time-started}
+                    else group.otherVariants=(group.otherVariants or 0)+1 group.lastArgs=args end
+                end
+            end
+        end
+    end
+    if probe.head>probe.tail then probe.head=1 probe.tail=0 probe.queue={} end
+end
+local noisy={DropperClick=true,BronzeDropperClick=true,CollectPart=true,MobAttackMlt=true,TreeHit=true,AutoTreeHit=true,EnemySwing=true,EnemyDamaged=true,RockDestroyed=true,Smelter=true,RockDamaged=true,Upgrade=true,Merchant=true}
+local function attachRemote(obj)
+    if remoteInfo[obj] or (not obj:IsA("RemoteEvent") and not obj:IsA("RemoteFunction")) then return end
+    local info={path=path(obj),class=obj.ClassName,related=word(obj.Name)} remoteInfo[obj]=info
+    if noisy[obj.Name] and not info.related then return end
+    probe.allowed[obj]=true
+    if #report.remoteInventory<35 then report.remoteInventory[#report.remoteInventory+1]=info end
+    if obj:IsA("RemoteEvent") then listen(obj.OnClientEvent,function(...)
+        if not running then return end
+        local action=select(1,...)
+        if info.related or probe.seen[obj] or os.clock()-lastTap<.4 or at()<1.2 or (type(action)=="string" and stateWord(action)) then enqueue("receive",obj,"OnClientEvent",...) end
+    end) end
+end
+
+-- Leitura de metadados; copias de script/protos nao sao executados.
+local function inspectLogic(token)
+    local dbg=debug or {}
+    local constants=dbg.getconstants or env.getconstants local upvalues=dbg.getupvalues or env.getupvalues
+    local protos=dbg.getprotos or env.getprotos local proto=dbg.getproto or env.getproto
+    local connections=getconnections or env.getconnections local closure=getscriptclosure or env.getscriptclosure local gc=getgc or env.getgc
+    report.logic.capabilities={constants=type(constants)=="function",upvalues=type(upvalues)=="function",protos=type(protos)=="function",activeProto=type(proto)=="function",connections=type(connections)=="function",scriptClosure=type(closure)=="function",gc=type(gc)=="function"}
+    local queue,seen,scripts={},setmetatable({}, {__mode="k"}),{}
+    local function source(fn)
+        local s,name,script="","",nil
+        if dbg.info then pcall(function() s,name=dbg.info(fn,"sn") end) end
+        if type(getfenv)=="function" then pcall(function() local e=getfenv(fn) script=rawget(e,"script") if typeof(script)=="Instance" then s=path(script) end end) end
+        return tostring(s or ""),tostring(name or "")
+    end
+    local function addFunction(fn,origin,live,owner,depth)
+        if type(fn)~="function" or own[fn] or seen[fn] or #queue>=160 then return end
+        seen[fn]=true queue[#queue+1]={fn=fn,origin=origin,live=live,owner=owner,depth=depth or 0}
     end
     local function owned(fn)
-        if diagnosticOwn[fn] then return false end
-        if type(api.executor)=="function" then
-            local ok,isOwn=pcall(api.executor,fn)
-            if ok and isOwn then return false end
+        if type(fn)~="function" or own[fn] then return false end
+        local s=source(fn) local l=s:lower()
+        return l:find("playerscripts",1,true) and word(l) and not l:find("coregui",1,true)
+    end
+    local ps=player:FindFirstChild("PlayerScripts") local client=ps and ps:FindFirstChild("Client")
+    local components=client and client:FindFirstChild("Components")
+    if components then
+        for i,obj in ipairs(components:GetDescendants()) do
+            if not current(token) then return end
+            if (obj:IsA("ModuleScript") or obj:IsA("LocalScript")) and word(obj.Name) and #scripts<6 then scripts[#scripts+1]=obj end
+            if i%80==0 then task.wait(.025) end
         end
-        local src=info(fn) local lower=src:lower()
-        if lower:find("coregui",1,true) or lower:find("corepackages",1,true) or lower:find("playermodule",1,true) then return false end
-        return (d.script and src==d.script) or lower:find("playerscripts.client.main",1,true)
-            or (lower:find("playerscripts",1,true) and lower:find("fish",1,true))
     end
-    local function add(fn,origin,path,live,bobberContext,parent,index,depth)
-        if type(fn)~="function" or diagnosticOwn[fn] or seen[fn] then return end
-        if #queue>=512 then scan.truncated=true return end
-        seen[fn]=true
-        queue[#queue+1]={fn=fn,origin=origin,path=path,live=live,bobberContext=bobberContext,parent=parent,index=index,depth=depth or 0}
-        scan.queued=#queue
+    for _,script in ipairs(scripts) do
+        report.logic.scripts[#report.logic.scripts+1]=path(script)
+        if type(closure)=="function" then local ok,fn=pcall(closure,script) if ok then addFunction(fn,"script-copy",false,path(script)) end end
+        task.wait(.025) if not current(token) then return end
     end
-    local function retain(row)
-        d.functions[#d.functions+1]=row
-        table.sort(d.functions,function(a,b)
-            if a.score==b.score then return a.kind=="active-reference" and b.kind~="active-reference" end
-            return a.score>b.score
-        end)
-        if #d.functions>10 then table.remove(d.functions) end
-    end
-    local function inspect(entry)
-        local fn=entry.fn local src,name=info(fn)
-        if src=="" then src=d.script or "" end
-        local lower=name:lower()
-        local componentOwned=fishingComponent and (src==d.script or entry.origin=="script-copy" or entry.origin=="prototype")
-        local bobberContext=entry.bobberContext or lower:find("bobber",1,true)~=nil
-        local score=bobberContext and 100 or (lower:find("fish",1,true) and 70 or 0)
-        local rows,numeric={},{}
-        if type(api.constants)=="function" then
-            local ok,values=pcall(api.constants,fn)
-            if ok and type(values)=="table" then
-                local n=0
-                for index,value in next,values do
-                    n=n+1 if n>320 then break end
-                    if type(value)=="string" then
-                        local s=value:lower()
-                        if s:find("bobber",1,true) then score=score+100 bobberContext=true
-                        elseif s:find("fishing",1,true) or s:find("reelbar",1,true) then score=score+70
-                        elseif s=="cast" or s=="bite" or s=="caught" then score=score+15
-                        elseif s:find("lerp",1,true) or s:find("tween",1,true) or s:find("duration",1,true) then score=score+15 end
-                        if related(value) and #rows<20 then rows[#rows+1]={index=tostring(index),value=value:sub(1,90)} end
-                    elseif type(value)=="number" and value==value and math.abs(value)<=120 and #numeric<16 then
-                        numeric[#numeric+1]={index=tostring(index),value=value}
-                    end
+    if type(connections)=="function" then
+        local signals={{Run.RenderStepped,"RenderStepped"},{UIS.InputBegan,"InputBegan"}}
+        if refs.button then signals[#signals+1]={refs.button.Activated,"Dig.Activated"} signals[#signals+1]={refs.button.MouseButton1Click,"Dig.MouseButton1Click"} end
+        for obj,info in pairs(remoteInfo) do if info.related and obj:IsA("RemoteEvent") then signals[#signals+1]={obj.OnClientEvent,info.path} end end
+        for _,item in ipairs(signals) do
+            local ok,list=pcall(connections,item[1])
+            if ok and type(list)=="table" then
+                local summary={source=item[2],foreign=0,accessible=0,total=0}
+                for i,c in ipairs(list) do
+                    if i>100 then summary.truncated=true break end summary.total=summary.total+1
+                    local good,fn,foreign=pcall(function() return c.Function,c.ForeignState end)
+                    if good and foreign then summary.foreign=summary.foreign+1 end
+                    if good and not foreign and owned(fn) then summary.accessible=summary.accessible+1 addFunction(fn,item[2],true) end
                 end
+                report.logic.signals[#report.logic.signals+1]=summary
             end
+            task.wait(.025) if not current(token) then return end
         end
-        if score>=70 or componentOwned then
-            local row={origin=entry.origin,path=entry.path,source=src,name=name,
-                kind=entry.live and "active-reference" or "metadata-only",score=score,constants={},upvalues={}}
-            for _,v in ipairs(numeric) do row.constants[#row.constants+1]=v end
-            for _,v in ipairs(rows) do if #row.constants<30 then row.constants[#row.constants+1]=v end end
-            if entry.live then scan.liveCandidates=scan.liveCandidates+1 else scan.metadataCandidates=scan.metadataCandidates+1 end
-            if bobberContext then
-                if entry.live then scan.liveBobberCandidates=scan.liveBobberCandidates+1 else scan.metadataBobberCandidates=scan.metadataBobberCandidates+1 end
-            end
-            if entry.live and type(api.upvalues)=="function" then
-                local ok,values=pcall(api.upvalues,fn)
+    end
+    local head=1
+    local function process()
+        while current(token) and head<=#queue do
+            local entry=queue[head] head=head+1
+            local src,name=source(entry.fn) if src=="" then src=entry.owner or "" end
+            local row={source=src,name=name,origin=entry.origin,kind=entry.live and "active-reference" or "metadata-only",constants={},upvalues={},score=0}
+            if type(constants)=="function" then
+                local ok,values=pcall(constants,entry.fn)
                 if ok and type(values)=="table" then
                     local n=0
-                    for index,value in next,values do
-                        n=n+1 if n>32 then break end
-                        local kind=typeof(value)
-                        if type(value)=="function" then
-                            add(value,"upvalue",entry.path.."/u"..tostring(index),true,bobberContext)
-                        elseif type(value)=="table" then
-                            local selected,count={},0
-                            for key,item in next,value do
-                                count=count+1 if count>100 then break end
-                                if type(key)=="string" and (related(key) or (type(item)=="function" and owned(item))) and #selected<6 then
-                                    selected[#selected+1]={key=key:sub(1,70),value=safe(item,0,{left=6})}
-                                    if type(item)=="function" then add(item,"upvalue-field",entry.path.."/"..key,true,bobberContext) end
+                    for k,v in next,values do
+                        n=n+1 if n>240 then break end
+                        if type(v)=="string" and stateWord(v) then row.score=row.score+10 if #row.constants<24 then row.constants[#row.constants+1]={index=tostring(k),value=v:sub(1,75)} end
+                        elseif type(v)=="number" and v==v and math.abs(v)<=100 and #row.constants<24 then row.constants[#row.constants+1]={index=tostring(k),value=v} end
+                    end
+                end
+            end
+            if entry.live and type(upvalues)=="function" then
+                if #monitored<4 then monitored[#monitored+1]={fn=entry.fn,source=src,name=name} end
+                local ok,values=pcall(upvalues,entry.fn)
+                if ok and type(values)=="table" then
+                    local n=0
+                    for k,v in next,values do
+                        n=n+1 if n>28 then break end
+                        if type(v)=="function" then addFunction(v,"upvalue:"..tostring(k),true,src,entry.depth+1)
+                        elseif typeof(v)=="Vector3" then row.upvalues[#row.upvalues+1]={index=tostring(k),value=short(v,0,{left=8})} candidate(v,src.."/upvalue"..k)
+                        elseif type(v)=="number" or type(v)=="boolean" then if #row.upvalues<8 then row.upvalues[#row.upvalues+1]={index=tostring(k),value=v} end
+                        elseif type(v)=="table" then
+                            local fields,count={},0
+                            for key,x in next,v do
+                                count=count+1 if count>80 then break end
+                                if type(key)=="string" and stateWord(key) and #fields<5 then
+                                    fields[#fields+1]={key=key,value=short(x,0,{left=8})} vectorLeaves(x,src.."/"..key,0,{left=20})
+                                    if type(x)=="function" then addFunction(x,"field:"..key,true,src,entry.depth+1) end
                                 end
                             end
-                            if #selected>0 then row.upvalues[#row.upvalues+1]={index=tostring(index),fields=selected} end
-                        elseif (kind=="number" or kind=="boolean" or kind=="Vector3" or kind=="Instance") and #row.upvalues<10 then
-                            row.upvalues[#row.upvalues+1]={index=tostring(index),value=safe(value,0,{left=6})}
-                        elseif type(value)=="string" and related(value) and #row.upvalues<10 then
-                            row.upvalues[#row.upvalues+1]={index=tostring(index),value=value:sub(1,100)}
+                            if #fields>0 and #row.upvalues<8 then row.upvalues[#row.upvalues+1]={index=tostring(k),fields=fields} end
                         end
                     end
                 end
             end
-            retain(row)
-            if entry.parent and entry.index and type(api.proto)=="function" then
-                local ok,instances=pcall(api.proto,entry.parent,entry.index,true)
-                if ok and type(instances)=="table" then
-                    for i,instance in ipairs(instances) do
-                        if i>4 then break end
-                        add(instance,"active-proto",entry.path.."/active"..i,true,bobberContext)
-                    end
-                end
+            if row.score>0 or word(name) then
+                report.logic.functions[#report.logic.functions+1]=row
+                table.sort(report.logic.functions,function(a,b) return a.score>b.score end)
+                if #report.logic.functions>8 then table.remove(report.logic.functions) end
             end
-        end
-        if entry.depth~=7 and type(api.protos)=="function" then
-            local ok,children=pcall(api.protos,fn)
-            if ok and type(children)=="table" then
-                local count=0
-                for index,child in next,children do
-                    count=count+1 if count>512 then scan.truncated=true break end
-                    add(child,"prototype",entry.path.."/p"..tostring(index),false,bobberContext,fn,index,entry.depth+1)
-                    if not pause(16) then return false end
-                end
+            if entry.depth<5 and type(protos)=="function" then
+                local ok,list=pcall(protos,entry.fn)
+                if ok and type(list)=="table" then for index,fn in pairs(list) do
+                    addFunction(fn,"prototype:"..tostring(index),false,src,entry.depth+1)
+                    if type(proto)=="function" then local good,active=pcall(proto,entry.fn,index,true) if good and type(active)=="table" then for i,live in ipairs(active) do if i>3 then break end addFunction(live,"active-proto",true,src,entry.depth+1) end end end
+                end end
             end
+            report.logic.inspected=head-1 task.wait(.025)
         end
-        return true
     end
-    local ok,err=pcall(function()
-        if main and type(api.closure)=="function" then
-            local good,fn=pcall(api.closure,main)
-            if good and type(fn)=="function" then add(fn,"script-copy","Main",false,false)
-            else fail("getscriptclosure",good and "closure unavailable" or fn) end
-        end
-        if main and type(api.senv)=="function" then
-            local good,scope=pcall(api.senv,main)
-            if good and type(scope)=="table" then
-                local count=0
-                for key,value in next,scope do
-                    count=count+1 if count>160 then break end
-                    if type(value)=="function" and (related(key) or owned(value)) then add(value,"script-env","env."..tostring(key),true,false) end
-                    if not pause(32) then return end
-                end
-            elseif not good then fail("getsenv",scope) end
-        end
-        if type(api.connections)=="function" then
-            for _,pair in ipairs({{fishing.OnClientEvent,"Fishing.OnClientEvent"},{Run.RenderStepped,"RenderStepped"},{UIS.InputBegan,"InputBegan"}}) do
-                local good,list=pcall(api.connections,pair[1])
-                local summary={total=0,foreign=0,accessible=0}
-                scan.signals[pair[2]]=summary
-                if good and type(list)=="table" then
-                    for i,c in ipairs(list) do
-                        summary.total=summary.total+1 if i>100 then summary.truncated=true break end
-                        local read,fn,foreign,on=pcall(function() return c.Function,c.ForeignState,c.Enabled end)
-                        if read and foreign then summary.foreign=summary.foreign+1 end
-                        if read and on~=false and type(fn)=="function" and not foreign and owned(fn) then
-                            summary.accessible=summary.accessible+1 add(fn,"signal",pair[2].."/"..i,true,false)
-                        end
-                        if not pause(32) then return end
-                    end
-                elseif not good then fail(pair[2],list) end
-            end
-        end
-        local function drain()
-            while head<=#queue and active() do
-                local entry=queue[head] head=head+1 scan.inspected=scan.inspected+1
-                if not inspect(entry) then return end
-                if not pause() then return end
-            end
-        end
-        drain()
-        if active() and scan.liveBobberCandidates==0 and type(api.gc)=="function" then
-            local good,list=pcall(api.gc,false)
-            if good and type(list)=="table" then
-                scan.gcTotal=#list scan.gcVisited=0
-                for _,value in ipairs(list) do
-                    scan.gcVisited=scan.gcVisited+1
-                    if scan.gcVisited>12000 then scan.gcTruncated=true break end
-                    if type(value)=="function" and owned(value) then add(value,"gc-owner","gc/"..scan.gcVisited,true,false) end
-                    if not pause(64) then return end
-                end
-                list=nil drain()
-            elseif not good then fail("getgc",list) end
-        end
-    end)
-    if not ok then fail("scan",err) end
-    scan.status=not active() and "stopped" or (scan.liveCandidates>0 and "active_references_found" or (scan.metadataCandidates>0 and "metadata_only" or "no_accessible_fishing_function"))
-    scan.flightFunctionStatus=scan.liveBobberCandidates>0 and "active_bobber_reference" or (scan.metadataBobberCandidates>0 and "bobber_metadata_only" or "bobber_function_not_found")
-    scan.finishedAt=now()-d.started
+    process()
+    if current(token) and #monitored==0 and type(gc)=="function" then
+        local ok,list=pcall(gc,false)
+        if ok and type(list)=="table" then for i,fn in ipairs(list) do
+            if i>10000 or not current(token) then break end
+            if type(fn)=="function" and owned(fn) then addFunction(fn,"gc-owner",true) end
+            if i%64==0 then task.wait(.025) end
+        end end
+        process()
+    end
+    if current(token) then report.logic.status=#monitored>0 and "active_references_found" or (#report.logic.functions>0 and "metadata_only" or "no_accessible_dig_function") end
 end
 
-stopDropDebug=function(shouldCopy)
-    if not dropDebug or not dropDebug.running then return end
-    local d=dropDebug d.running=false d.seconds=now()-d.started
-    if d.scan and d.scan.status=="scanning" then d.scan.status="stopping" end
-    if dropConnection then dropConnection:Disconnect() dropConnection=nil end
-    observeDropEvent=nil
-    local summary={casts=#d.cycles,caught=0,escaped=0}
-    for _,field in ipairs({"castToLand","castToBite","landToBite","biteToBar","castToCaught","recastGap"}) do
-        local count,sum,min,max=0,0,nil,nil
-        for _,entry in ipairs(d.cycles) do
-            local value=entry[field]
-            if type(value)=="number" then count=count+1 sum=sum+value min=not min and value or math.min(min,value) max=not max and value or math.max(max,value) end
-        end
-        if count>0 then summary[field]={n=count,mean=sum/count,min=min,max=max} end
-    end
-    for _,entry in ipairs(d.cycles) do if entry.caughtAt then summary.caught=summary.caught+1 end if entry.escapedAt then summary.escaped=summary.escaped+1 end end
-    d.summary=summary
-    dropButton.Text="Debug queda (12 s)"
-    if shouldCopy and copy then copy() end
-end
-startDropDebug=function()
-    if not alive or (dropDebug and dropDebug.running) then return end
-    local d={format="fishing-fall-debug-v2",running=true,started=now(),readOnly=true,events={},cycles={},parts={},
-        note="Metadados de copia de script nao sao funcao ativa. Aterrissagem estimada perto do ponto recebido no Cast; nao comprova limite do servidor."}
-    dropDebug=d report.dropDebug=d dropButton.Text="Parar debug / copiar"
-    local state={connections={},roots={},rootList={},rootId=0,current=nil,lastCaught=nil,lastSample=-math.huge}
-    local function active() return alive and d.running and dropDebug==d end
-    local function listen(signal,fn)
-        diagnosticOwn[fn]=true
-        state.connections[#state.connections+1]=signal:Connect(fn)
-    end
-    dropConnection={Disconnect=function()
-        for _,c in ipairs(state.connections) do c:Disconnect() end
-        state.connections={} state.roots={} state.rootList={}
-    end}
-    local function attach(obj,preexisting)
-        local root=obj
-        for _=1,4 do
-            if not root or root==workspace then return end
-            if root.Name=="Bobber" and root.Parent==workspace then break end
-            root=root.Parent
-        end
-        if not root or root==workspace or root.Name~="Bobber" or root.Parent~=workspace then return end
-        local entry=state.roots[root]
-        if not entry then
-            if #state.rootList>=24 then d.rootLimit=true return end
-            state.rootId=state.rootId+1
-            entry={root=root,id=state.rootId,seenAt=now(),preexisting=preexisting==true}
-            state.roots[root]=entry state.rootList[#state.rootList+1]=entry
-        end
-        if obj:IsA("BasePart") and (obj.Name=="Ball" or not entry.ball) then entry.ball=obj end
-        local ball=root:FindFirstChild("Ball")
-        if ball and ball:IsA("BasePart") then entry.ball=ball end
-    end
-    for _,root in ipairs(workspace:GetChildren()) do
-        if root.Name=="Bobber" then attach(root,true) end
-    end
-    listen(workspace.DescendantAdded,function(obj) if active() then attach(obj,false) end end)
-    observeDropEvent=function(action,...)
-        if not active() then return end
-        local args=table.pack(...) local t=now()
-        if action=="Cast" then
-            if #d.cycles>=8 then d.cycleLimit=true state.current=nil return end
-            local target=args[1]
-            local row={index=#d.cycles+1,castAt=t,serverValue=safe(args[2],0,{left=3}),autoFlag=args[3]}
-            if typeof(target)=="Vector3" then row.target={x=target.X,y=target.Y,z=target.Z} end
-            if state.lastCaught then row.recastGap=t-state.lastCaught end
-            d.cycles[#d.cycles+1]=row state.current=row
-        elseif state.current then
-            local row=state.current
-            if action=="Bite" then
-                row.biteAt=t row.castToBite=t-row.castAt row.rarity=tostring(args[1])
-                if row.landedAt then row.landToBite=t-row.landedAt end
-            elseif action=="Caught" then
-                row.caughtAt=t row.castToCaught=t-row.castAt row.fish=tostring(args[1]) state.lastCaught=t
-            elseif action=="Escaped" then row.escapedAt=t end
-        end
-    end
-    listen(UIS.InputBegan,function(input,processed)
-        local row=state.current
-        if not active() or not row or not row.biteAt or row.hookInputAt or processed then return end
-        if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseButton1 then row.hookInputAt=now() row.biteToInput=row.hookInputAt-row.biteAt end
-    end)
-    listen(Run.RenderStepped,function()
-        if not active() then return end
-        local row=state.current if not row then return end
-        local shown,percent=progress()
-        local t=now()
-        if shown and not row.barAt then row.barAt=t if row.biteAt then row.biteToBar=t-row.biteAt end end
-        if shown and percent and percent>=99.95 and row.barAt and not row.fullAt then row.fullAt=t end
-        if not row.target or row.caughtAt or row.escapedAt then return end
-        for _,entry in ipairs(state.rootList) do
-            local ball=entry.ball
-            if not entry.preexisting and entry.seenAt>=row.castAt-.15 and not entry.owner and ball and ball.Parent and entry.root.Parent==workspace then
-                local p=ball.Position local target=row.target
-                local dx,dz=p.X-target.x,p.Z-target.z
-                local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-                local nearPlayer=not root or (p-root.Position).Magnitude<18
-                if nearPlayer or dx*dx+dz*dz<9 then
-                    entry.owner=row entry.data={id=entry.id,cycle=row.index,path=ball:GetFullName(),class=ball.ClassName,samples={},association="near_player_then_target"}
-                    d.parts[#d.parts+1]=entry.data
-                end
-            end
-            if entry.owner==row and ball and ball.Parent and entry.root.Parent==workspace then
-                local p=ball.Position local target=row.target local data=entry.data
-                if p.Y-target.y>.5 then
-                    data.sawAir=true
-                    if row.bobberId==entry.id and row.landedAt and not row.biteAt then
-                        -- Algumas criacoes comecam no alvo antes de iniciar o arco visual.
-                        row.landedAt=nil row.castToLand=nil row.bobberId=nil row.landToBite=nil
-                        data.earlyTargetDiscarded=true
-                    end
-                end
-                if t-(entry.sampleAt or -math.huge)>=.04 and #data.samples<24 and (not row.landedAt or t-row.landedAt<.15) then
-                    data.samples[#data.samples+1]={t=t-row.castAt,x=p.X,y=p.Y,z=p.Z} entry.sampleAt=t
-                end
-                local dx,dz=p.X-target.x,p.Z-target.z
-                if dx*dx+dz*dz<=1 and math.abs(p.Y-target.y)<=.3 then
-                    entry.contactAt=entry.contactAt or t
-                    if not row.landedAt and t-entry.contactAt>=.02 then
-                        row.landedAt=entry.contactAt row.castToLand=row.landedAt-row.castAt row.bobberId=entry.id
-                        data.association="reached_server_target"
-                        if row.biteAt then row.landToBite=row.biteAt-row.landedAt end
-                    end
-                else entry.contactAt=nil end
-            end
-        end
-    end)
-    task.spawn(function() scanFallFunctions(d,active) end)
-    task.spawn(function()
-        while active() and now()-d.started<12 do task.wait(.1) end
-        if active() then stopDropDebug(true) end
-    end)
-end
-
-local function resetCycle(reason)
-    release()
-    cycle=cycle+1 stage="idle" stateAt=os.clock() castAt=nil biteAt=nil hookAt=nil
-    autoOwned=false completionSent=false geometry={} hookAttempts=0
-    nextClick=os.clock()+math.min(frameDuration,.04) phase=reason or "Aguardando"
-end
-local function controlBar(dt)
-    local bar=reelBar()
-    local track=bar and bar:FindFirstChild("Track")
-    local lane=track and track:FindFirstChild("Lane")
-    local zone=lane and lane:FindFirstChild("Zone")
-    local fish=lane and lane:FindFirstChild("Fish")
-    if not lane or not zone or not fish or lane.AbsoluteSize.X<=0 or zone.AbsoluteSize.X<=0 then
-        phase="Aguardando os elementos da barra" return
-    end
-    local left,width=lane.AbsolutePosition.X,lane.AbsoluteSize.X
-    local zx=(zone.AbsolutePosition.X+zone.AbsoluteSize.X*.5-left)/width
-    local fx=(fish.AbsolutePosition.X+fish.AbsoluteSize.X*.5-left)/width
-    local zw=math.clamp(zone.AbsoluteSize.X/width,.01,1)
-    dt=math.clamp(dt or 1/60,.004,.08)
-    local t=os.clock() local g=geometry
-    g.started=g.started or t
-    local movement=g.zone and zx-g.zone or 0
-    local zv=g.zone and movement/dt or 0
-    local fv=g.fish and (fx-g.fish)/dt or 0
-    g.zv=(g.zv or 0)*.45+math.clamp(zv,-4,4)*.55
-    g.fv=(g.fv or 0)*.6+math.clamp(fv,-4,4)*.4
-    -- O centro da zona nao pode ultrapassar as bordas reais da pista.
-    local minX,maxX=zw*.5,1-zw*.5
-    local target=math.clamp(fx+g.fv*.025,minX,maxX)
-    local projected=zx+g.zv*.03
-    local error=target-projected
-    local dead=math.clamp(zw*.015,.0025,.007)
-    local desired=held
-    if error>dead then desired=true elseif error< -dead then desired=false end
-    local wanted=desired
-    if g.releaseUntil and t<g.releaseUntil then desired=false end
-    if desired~=held then g.commandAt=t end
-    if not setHeld(desired) then
-        if pointBlocked then phase="Ponto de clique coberto pela interface" g.lastMove=t
-        elseif chooseMode("Segurar/soltar recusado") then setHeld(desired,true) end
-    end
-    if math.abs(movement)>.0006 then
-        g.lastMove=t inputWorking=true
-        if not g.firstResponseAt and ((wanted and movement>0) or (not wanted and movement<0)) then g.firstResponseAt=t end
-    end
-    g.lastMove=g.lastMove or t
-    local atLimit=(wanted and zx>=maxX-.04) or (not wanted and zx<=minX+.04)
-    local needsMotion=math.abs(error)>math.max(dead*2,.012)
-    local wrongWay=(wanted and g.zv<-.08) or (not wanted and g.zv>.08)
-    local commandSettled=t-(g.commandAt or g.started)>.12
-    -- Detecta comando perdido inclusive quando o peixe ainda esta DENTRO da zona larga.
-    if needsMotion and not atLimit and commandSettled and (t-g.lastMove>.16 or wrongWay)
-        and t-(g.lastResync or -math.huge)>.3 then
-        release(true) g.commandAt=t g.lastResync=t g.lastMove=t
-        g.releaseUntil=t+math.min(frameDuration*.75,.03)
-        report.holdResyncs=report.holdResyncs+1
-    end
-    g.zone,g.fish,g.width=zx,fx,zw
-    g.error=error g.inside=math.abs(fx-zx)<=zw*.5
-    local _,percent=progress()
-    if percent then g.peak=math.max(g.peak or 0,percent) if percent<99 then g.sawBelowFull=true end end
-    report.controller={t=now(),fish=fx,zone=zx,width=zw,held=held,inside=g.inside,peak=g.peak,inputWorking=inputWorking,
-        firstResponseMs=g.firstResponseAt and math.floor((g.firstResponseAt-g.started)*1000+.5)}
-end
-local function onServer(action,...)
-    if not alive then return end
-    if enabled or (dropDebug and dropDebug.running) then record("server",action,...) end
-    if observeDropEvent then
-        local ok,err=pcall(observeDropEvent,action,...)
-        if not ok and dropDebug then dropDebug.observationError=tostring(err) end
-    end
-    if not enabled then return end
-    local args=table.pack(...)
-    if action=="Cast" then
-        if autoOwned and rod() then
-            stage="waitingBite" stateAt=os.clock()
-            castAt=castAt or os.clock() inputWorking=true castCheckAt=os.clock()
-            report.castsAccepted=report.castsAccepted+1
-            release(true) phase="Vara lancada; aguardando !"
-        end
-    elseif action=="Bite" then
-        report.bites=report.bites+1 biteAt=os.clock()
-        if autoOwned and rod() then
-            stage="hooking" stateAt=os.clock() phase="Fisgando"
-            hookAt=os.clock() hookAttempts=0 release(true) nextClick=os.clock()+math.min(frameDuration,.04)
-            record("input","Hook agendado no !")
-        end
-    elseif action=="Caught" then
-        -- Touch sintetico no mobile nao identifica autoria. Conta apenas o evento real,
-        -- sem classificar centenas de eventos injetados como intervencao manual.
-        report.caught=report.caught+1
-            report.catches[#report.catches+1]={t=now(),fish=safe(args[1],0,{left=8}),value2=safe(args[2],0,{left=8}),
-                value3=safe(args[3],0,{left=8}),autoFlag=args[4],seconds=castAt and os.clock()-castAt,
-                localPeak=geometry.peak,mode=modes[modeIndex] and modes[modeIndex].name,
-                firstResponseMs=geometry.firstResponseAt and math.floor((geometry.firstResponseAt-geometry.started)*1000+.5)}
-            if #report.catches>8 then table.remove(report.catches,1) end
-        resetCycle("Captura confirmada; relancando")
-        castCheckAt=os.clock() attemptsSinceCheck=0
-    elseif action=="Escaped" then
-        report.escaped=report.escaped+1 resetCycle("Peixe escapou; relancando")
-        castCheckAt=os.clock() attemptsSinceCheck=0
-    end
-end
-connect(fishing.OnClientEvent,onServer)
-restoreMobile=function()
-    if not mobileDevice then return end
-    restoreGeneration=restoreGeneration+1
-    local generation=restoreGeneration
-    local result={requested=true,status="restoring",nativeTouch=false,errors={}}
-    report.mobileRestore=result
-    local function valid()
-        return not enabled and generation==restoreGeneration and env.__NetoFishingMobileToken==mobileToken
-    end
-    local function forceGui()
-        pcall(function() game:GetService("GuiService").TouchControlsEnabled=true result.touchControlsEnabled=true end)
-        local pg=player:FindFirstChild("PlayerGui") local touch=pg and pg:FindFirstChild("TouchGui")
-        if touch then
-            touch.Enabled=true
-            local frame=touch:FindFirstChild("TouchControlFrame")
-            if frame then
-                frame.Visible=true
-                local jump=frame:FindFirstChild("JumpButton",true)
-                if jump then jump.Visible=true end
-            end
-            result.touchGuiVisible=true
-        end
-    end
-    forceGui()
-    task.spawn(function()
-        if not valid() then return end
-        -- Seleciona novamente os controles de toque do PlayerModule, incluindo o pulo.
-        local ok,err=pcall(function()
-            local ps=player:FindFirstChild("PlayerScripts")
-            local module=ps and ps:FindFirstChild("PlayerModule")
-            if not module then return end
-            local playerModule=require(module)
-            if not valid() then return end
-            local controls=type(playerModule.GetControls)=="function" and playerModule:GetControls()
-            if not controls then return end
-            if type(controls.OnLastInputTypeChanged)=="function" then controls:OnLastInputTypeChanged(Enum.UserInputType.Touch)
-            elseif type(controls.OnPreferredInputChanged)=="function" then controls:OnPreferredInputChanged(Enum.PreferredInput.Touch) end
-            if type(controls.SelectTouchModule)=="function" and type(controls.SwitchToController)=="function" then
-                local selected=controls:SelectTouchModule()
-                if selected then controls:SwitchToController(selected) result.controllerSelected=true end
-            end
-            if type(controls.Enable)=="function" then controls:Enable(true) end
-            if controls.touchJumpController and type(controls.touchJumpController.Enable)=="function" then
-                controls.touchJumpController:Enable(true,controls.touchControlFrame) result.jumpEnabled=true
-            end
-            if controls.touchControlFrame then controls.touchControlFrame.Visible=true end
+testZone=function(value,preserveGameChange)
+    if value==nil then value=visual==nil end
+    if not value and visual then
+        local old=visual visual=nil
+        local function same(a,b) return a.X.Scale==b.X.Scale and a.X.Offset==b.X.Offset and a.Y.Scale==b.Y.Scale and a.Y.Offset==b.Y.Offset end
+        pcall(function()
+            if same(old.obj.Size,old.testSize) then old.obj.Size=old.size old.record.restoredSize=true end
+            if same(old.obj.Position,old.testPosition) then old.obj.Position=old.position old.record.restoredPosition=true end
         end)
-        if not ok then result.errors[#result.errors+1]=tostring(err):sub(1,140) end
-    end)
-    task.spawn(function()
-        task.wait(.025)
-        if not valid() then return end
-        -- Toque consumido por uma Frame vazia: muda o dispositivo sem clicar no jogo.
-        local vim,sendTouch
-        pcall(function() vim=game:GetService("VirtualInputManager") sendTouch=vim.SendTouchEvent end)
-        if type(sendTouch)=="function" then
-            local pg=player:FindFirstChild("PlayerGui")
-            local shield=Instance.new("ScreenGui") shield.Name="NetoFishingMobileRestore"
-            shield.IgnoreGuiInset=true shield.ResetOnSpawn=false shield.DisplayOrder=2147483000 shield.Parent=pg
-            local frame=Instance.new("Frame") frame.Name="InputShield" frame.Size=UDim2.new(1,0,1,0)
-            frame.BackgroundTransparency=1 frame.Active=true frame.Parent=shield
-            local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
-            local x,y=math.floor(view.X*.5),math.floor(view.Y*.4)
-            local id=900000+math.floor(os.clock()*1000)%100000
-            local sent,message=pcall(sendTouch,vim,id,0,x,y)
-            if sent then task.wait(.03)
-            elseif #result.errors<3 then result.errors[#result.errors+1]=tostring(message):sub(1,140) end
-            -- Encerra o dedo mesmo com cancelamento ou erro parcial no envio inicial.
-            local ended=pcall(sendTouch,vim,id,2,x,y)
-            result.nativeTouch=sent and ended
-            shield:Destroy()
-        end
-        for _,delay in ipairs({0,.1,.25}) do
-            if delay>0 then task.wait(delay) end
-            if not valid() then result.status="cancelled" return end
-            forceGui()
-        end
-        pcall(function() result.lastInput=tostring(UIS:GetLastInputType()) end)
-        pcall(function() result.preferredInput=tostring(UIS.PreferredInput) end)
-        result.status="done"
-    end)
+        old.record.gameChanged=preserveGameChange or nil
+        old.record.stoppedAt=at() testButton.Text="Testar faixa verde: OFF" return
+    end
+    if not value then return end
+    if not running or not refs.zone or not refs.zone.Parent or not refs.marker or not shown(refs.zone) then label.Text="Inicie o debug e espere o minigame com a faixa verde." return end
+    if visual then return end
+    local g=geometry() if not g then return end
+    local zone=refs.zone
+    local row={startedAt=at(),path=path(zone),originalStart=g.greenStart,originalWidth=g.greenWidth,taps=0,outsideOriginalTaps=0,transitions={},changes="visual_only"}
+    add(report.visualTests,row,4)
+    visual={obj=zone,size=zone.Size,position=zone.Position,record=row,originalStart=g.greenStart,originalWidth=g.greenWidth,
+        testSize=UDim2.new(1,0,zone.Size.Y.Scale,zone.Size.Y.Offset),testPosition=UDim2.new(zone.AnchorPoint.X,0,zone.Position.Y.Scale,zone.Position.Y.Offset)}
+    zone.Size=visual.testSize zone.Position=visual.testPosition
+    testButton.Text="Restaurar faixa verde"
+    label.Text="Faixa VISUAL ampliada. Compare um clique fora da faixa original; camada e eventos dirao se foi aceito."
 end
-toggle=function(value)
-    if not alive then return end
-    if value==nil then value=not enabled end
-    restoreGeneration=restoreGeneration+1
-    release(true) enabled=value==true resetCycle(enabled and "Chegue perto do lago" or "OFF")
-    if enabled then
-        refreshModes() castCheckAt=os.clock() attemptsSinceCheck=0
-        if #modes==0 then enabled=false phase="Executor sem clique virtual. Copie o resultado." restoreMobile()
-        elseif rod() then phase="Clicando rapido para lancar"
-        else phase="Auto ligado; aproxime-se do lago para equipar a vara" end
-    else restoreMobile() end
-    autoButton.Text=enabled and "Auto Fish: ON" or "Auto Fish: OFF"
+
+local lastPhase,lastLayer,lastHud="unknown",nil,""
+local movement=nil local lastPos,lastPosAt=nil,nil
+local function sampleState()
+    if not running then return end
+    local phase,signal,layer,texts=readHud() local g=geometry() local t=at()
+    report.ui={phase=phase,signal=signal,layer=layer,texts=texts,geometry=g}
+    local hudKey=Http:JSONEncode(texts)
+    if hudKey~=lastHud then add(report.messages,{t=t,phase=phase,layer=layer,texts=texts,visualTest=visual~=nil},12) lastHud=hudKey end
+    if phase~=lastPhase or layer~=lastLayer then
+        local event={t=t,from=lastPhase,to=phase,layer=layer,signal=signal,visualTest=visual~=nil}
+        add(report.transitions,event,18)
+        if visual then
+            add(visual.record.transitions,event,6)
+            if layer~=lastLayer or phase~="digging" then
+                -- A new layer can already have written new coordinates: never put stale ones over it.
+                local changed=visual.obj.Size.X.Scale<.99 or visual.obj.Position.X.Scale~=visual.obj.AnchorPoint.X or visual.obj.Position.X.Offset~=0
+                testZone(false,changed)
+            end
+        end
+        lastPhase,lastLayer=phase,layer
+    end
+    if visual then
+        if refs.zone.Size.X.Scale<.99 then visual.record.overwrittenByGameAt=t testZone(false,true)
+        elseif g then visual.record.observedWidth=g.greenWidth end
+    end
+    local p=position()
+    if p and lastPos then
+        local distance=(p-lastPos).Magnitude
+        if distance>.3 then
+            if not movement then movement={from=vec(lastPos),to=vec(p),started=lastPosAt or t,ended=t,distance=0,maxStep=0} add(report.movement,movement,10) end
+            movement.to=vec(p) movement.ended=t movement.distance=movement.distance+distance movement.maxStep=math.max(movement.maxStep,distance)
+            for _,target in ipairs(report.targets) do if not target.firstMovementAfter and target.firstSeen<=t then target.firstMovementAfter=t end end
+        elseif movement and t-movement.ended>.25 then movement=nil end
+    end
+    if p then
+        for _,target in ipairs(report.targets) do
+            local v=Vector3.new(target.position.x,target.position.y,target.position.z) local distance=(p-v).Magnitude
+            target.minDistance=math.min(target.minDistance or math.huge,distance)
+            if distance<3.5 and not target.arrivedAt then target.arrivedAt=t target.leadSeconds=t-target.firstSeen end
+        end
+        lastPos=p lastPosAt=t
+    end
+    local getup=(debug and debug.getupvalues) or env.getupvalues
+    if type(getup)=="function" then
+        for _,entry in ipairs(monitored) do
+            local ok,values=pcall(getup,entry.fn)
+            if ok and type(values)=="table" then
+                local count,state=0,{}
+                for key,v in next,values do
+                    count=count+1 if count>24 then break end
+                    if (type(v)=="boolean" or type(v)=="number") and #state<8 then state[#state+1]={index=tostring(key),value=short(v,0,{left=3})} end
+                    if typeof(v)=="Vector3" then candidate(v,entry.source.."/upvalue"..key)
+                    elseif type(v)=="table" then
+                        local n=0 for k,x in next,v do n=n+1 if n>70 then break end if type(k)=="string" and stateWord(k) then vectorLeaves(x,entry.source.."/"..k,0,{left=20}) end end
+                    end
+                end
+                local signature=Http:JSONEncode(state)
+                if #state>0 and signature~=entry.lastState then
+                    entry.lastState=signature add(report.logic.states,{t=t,source=entry.source,values=state,layer=layer,geometry=g},10)
+                end
+            end
+        end
+    end
+end
+local function updateLabel()
+    if visual then return end
+    if running then label.Text="Gravando: "..math.floor(at()).."/30 s\n"..(refs.button and "Dig detectado" or "Procurando o botao Dig...").." | "..#report.calls.." grupos de eventos\nComplete um ciclo normal; o teste da faixa e opcional."
+    else label.Text="Parado. Use Copiar resultado para enviar o diagnostico." end
 end
 copy=function()
-    report.enabled=enabled report.phase=phase report.stage=stage report.seconds=now() report.interval=interval
-    report.hasRod=rod()~=nil
-    local shown,n=progress() report.ui={barVisible=shown,percent=n}
     local export={} for k,v in pairs(report) do export[k]=v end
+    export.running=running export.seconds=running and at() or (report.seconds or 0) export.dropped=(report.dropped or 0)+(probe.dropped or 0)
+    export.calls={}
+    for _,group in ipairs(report.calls or {}) do
+        local g={} for k,v in pairs(group) do if k~="variants" then g[k]=v end end g.variants={}
+        for _,variant in ipairs(group.variants) do local v={} for k,x in pairs(variant) do if k~="signature" then v[k]=x end end g.variants[#g.variants+1]=v end
+        export.calls[#export.calls+1]=g
+    end
+    if report.logic then
+        export.logic={} for k,v in pairs(report.logic) do if k~="functions" then export.logic[k]=v end end export.logic.functions={}
+        for _,fn in ipairs(report.logic.functions) do local r={} for k,v in pairs(fn) do r[k]=v end export.logic.functions[#export.logic.functions+1]=r end
+    end
     local payload=Http:JSONEncode(export)
-    if #payload>18000 and dropDebug then
-        local d={} for k,v in pairs(dropDebug) do if k~="parts" then d[k]=v end end d.parts={}
-        for _,part in ipairs(dropDebug.parts) do
-            local samples={}
-            for i,sample in ipairs(part.samples) do if i<=3 or i>#part.samples-6 then samples[#samples+1]=sample end end
-            d.parts[#d.parts+1]={path=part.path,class=part.class,samples=samples}
+    if #payload>19000 then
+        export.trimmed=true export.remoteInventory=nil
+        for _,f in ipairs(export.logic and export.logic.functions or {}) do
+            local rows={} for i,row in ipairs(f.constants or {}) do if i<=16 then rows[#rows+1]=row end end f.constants=rows
         end
-        export.dropDebug=d export.trimmed=true payload=Http:JSONEncode(export)
-    end
-    if #payload>18000 and export.dropDebug then
-        -- Prioriza tempos por ciclo e funcoes; nao repete o historico em dois campos.
-        local full=export.dropDebug local compact={}
-        for k,v in pairs(full) do if k~="events" and k~="parts" and k~="functions" then compact[k]=v end end
-        compact.parts={} compact.functions={}
-        for i,part in ipairs(full.parts or {}) do
-            if i>math.max(0,#full.parts-2) then
-                local samples={}
-                for n,sample in ipairs(part.samples or {}) do if n<=3 or n>#part.samples-3 then samples[#samples+1]=sample end end
-                compact.parts[#compact.parts+1]={id=part.id,cycle=part.cycle,path=part.path,class=part.class,association=part.association,samples=samples}
-            end
-        end
-        for i,fn in ipairs(full.functions or {}) do
-            if i>7 then break end
-            local row={} for k,v in pairs(fn) do if k~="constants" and k~="upvalues" then row[k]=v end end
-            row.constants={} row.upvalues={}
-            for n,v in ipairs(fn.constants or {}) do if n<=24 then row.constants[#row.constants+1]=v end end
-            for n,v in ipairs(fn.upvalues or {}) do if n<=6 then row.upvalues[#row.upvalues+1]=v end end
-            compact.functions[#compact.functions+1]=row
-        end
-        export.events=nil export.dropDebug=compact export.trimmed=true
         payload=Http:JSONEncode(export)
-        while #payload>18000 and #compact.functions>2 do
-            table.remove(compact.functions) payload=Http:JSONEncode(export)
-        end
-        if #payload>18000 then
-            compact.parts={}
-            for _,fn in ipairs(compact.functions) do
-                local small={}
-                for n,value in ipairs(fn.upvalues or {}) do
-                    if n>3 then break end
-                    if value.fields then
-                        local fields={} for i,field in ipairs(value.fields) do if i<=2 then fields[#fields+1]=field end end
-                        small[#small+1]={index=value.index,fields=fields}
-                    else small[#small+1]=value end
-                end
-                fn.upvalues=small
-            end
-            payload=Http:JSONEncode(export)
-        end
     end
-    env.FishingAutoTestReport=payload
-    local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard
-    local ok,result=false,nil
+    while #payload>19000 and export.logic and #export.logic.functions>2 do table.remove(export.logic.functions) payload=Http:JSONEncode(export) end
+    if #payload>19000 then
+        export.world=nil
+        local function recent(list,count) local r={} for i=math.max(1,#list-count+1),#list do r[#r+1]=list[i] end return r end
+        export.messages=recent(export.messages or {},6) export.taps=recent(export.taps or {},10)
+        if export.logic then export.logic.states=recent(export.logic.states or {},4) end
+        for _,g in ipairs(export.calls) do while #g.variants>1 do table.remove(g.variants) end g.lastArgs=nil end
+        payload=Http:JSONEncode(export)
+    end
+    while #payload>19000 and #export.calls>8 do
+        local index=#export.calls
+        for i=#export.calls,1,-1 do if not export.calls[i].related then index=i break end end
+        table.remove(export.calls,index) export.trimmedGroups=(export.trimmedGroups or 0)+1 payload=Http:JSONEncode(export)
+    end
+    while #payload>19000 do
+        if #(export.messages or {})>2 then table.remove(export.messages,1)
+        elseif #(export.taps or {})>4 then table.remove(export.taps,1)
+        elseif #export.calls>3 then table.remove(export.calls) export.trimmedGroups=(export.trimmedGroups or 0)+1
+        elseif export.logic then export.logic=nil
+        elseif export.geometry then export.geometry=nil
+        else break end
+        payload=Http:JSONEncode(export)
+    end
+    env.DigDebugReport=payload
+    local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard local ok,result=false,nil
     if type(clip)=="function" then ok,result=pcall(clip,payload) end
-    output.Text=payload output.Visible=not (ok and result~=false)
+    output.Text=payload output.Visible=not(ok and result~=false)
     if output.Visible then panel.Visible=true mini.Visible=false end
     return payload
 end
+stop=function(shouldCopy)
+    if running then drain() testZone(false) running=false generation=generation+1 probe.enabled=false probe.allowed={} disconnect(sessionLinks)
+        report.seconds=at() report.running=false end
+    startButton.Text="Iniciar debug (30 s)" updateLabel()
+    if shouldCopy~=false then return copy() end
+end
+start=function()
+    if not alive or running then return end
+    started=os.clock() running=true generation=generation+1 local token=generation refs={objects={}}
+    bound=setmetatable({}, {__mode="k"}) pendingButtons={} targetKeys={} groupKeys={} remoteInfo={} monitored={}
+    lastPhase,lastLayer,lastHud="unknown",nil,"" movement=nil lastPos=nil lastPosAt=nil lastTap=-math.huge
+    report={format="dig-debug-v1",placeId=game.PlaceId,note="Somente observacao, exceto teste VISUAL opcional e reversivel. Aumento visual nao prova tolerancia real; alvos sao candidatos, nao TP validado. Cliques podem ser manuais ou da gamepass.",
+        calls={},remoteInventory={},taps={},transitions={},messages={},targets={},movement={},visualTests={},dropped=0,logic={status="scanning",scripts={},signals={},functions={},states={}},world={},tools={}}
+    probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.allowed={} probe.seen={}
+    local remotes=RS:FindFirstChild("Remotes")
+    if remotes then for _,obj in ipairs(remotes:GetDescendants()) do attachRemote(obj) end listen(remotes.DescendantAdded,attachRemote) end
+    local supported,err=installProbe() report.outgoingCapture=supported report.captureError=err probe.enabled=supported
+    listen(pg.DescendantAdded,function(obj)
+        if obj:IsA("GuiButton") and not obj:IsDescendantOf(gui) then
+            if #pendingButtons<320 then pendingButtons[#pendingButtons+1]=obj end
+            (task.defer or task.spawn)(function() if current(token) then bindButton(obj) end end)
+        end
+    end)
+    startButton.Text="Debug gravando..." output.Visible=false
+    task.spawn(function()
+        local ok,err=pcall(function() discoverUi(token) if current(token) then inspectWorld(token) end if current(token) then inspectLogic(token) end end)
+        if not ok and current(token) then report.logic.error=tostring(err):sub(1,220) end
+    end)
+    task.spawn(function()
+        local refreshAt=-math.huge
+        while current(token) and at()<30 do
+            drain()
+            if at()-refreshAt>.5 then
+                refreshAt=at()
+                for _,obj in ipairs(pendingButtons) do if obj.Parent and not bound[obj] then bindButton(obj) end end
+                refreshObjects() findGeometry()
+            end
+            sampleState() updateLabel() task.wait(.1)
+        end
+        if current(token) then stop(true) end
+    end)
+end
 close=function()
-    if not alive then return end
-    if dropDebug and dropDebug.running then stopDropDebug(false) end
-    toggle(false) alive=false
-    for _,c in ipairs(links) do c:Disconnect() end
-    gui:Destroy()
+    if not alive then return end stop(false) alive=false disconnect(links) gui:Destroy()
 end
-env.FishingAutoTest={Toggle=toggle,Copy=copy,Close=close,Report=report,StartDropDebug=function() startDropDebug() end,StopDropDebug=function() stopDropDebug(true) end}
-connect(autoButton.Activated,function() toggle() end)
-connect(copyButton.Activated,copy)
-connect(dropButton.Activated,function() if dropDebug and dropDebug.running then stopDropDebug(true) else startDropDebug() end end)
-connect(exit.Activated,close)
-connect(minimize.Activated,function() mini.Position=panel.Position panel.Visible=false mini.Visible=true clickPoint.at=-math.huge end)
-connect(mini.Activated,function() panel.Position=mini.Position panel.Visible=true mini.Visible=false clickPoint.at=-math.huge end)
-connect(intervalBox.FocusLost,function()
-    local n=tonumber((intervalBox.Text:gsub(",",".")))
-    if n and n==n then interval=math.clamp(n,.001,3) end
-    intervalBox.Text=tostring(interval) report.interval=interval
-end)
-local lastRod=nil
-local function recover(reason)
-    if os.clock()-lastRecovery<3 then return end
-    lastRecovery=os.clock() report.recoveries=report.recoveries+1
-    release(true) resetCycle(reason) castCheckAt=os.clock() attemptsSinceCheck=0
-    nextClick=os.clock()+.1 record("recovery",reason)
-end
-local function finishCatch()
-    local shown,n=progress()
-    if shown and (not n or n<99.95) then return end
-    if not completionSent and geometry.sawBelowFull and (geometry.peak or 0)>=99.95 and os.clock()-stateAt>.2 then
-        completionSent=true report.catchRequests=report.catchRequests+1 record("send","Catch after 100%")
-        fishing:FireServer("Catch")
-    end
-end
-local function step(dt)
-    if not alive or not enabled then return end
-    frameDuration=math.clamp(dt or 1/60,.004,.1)
-    local tool=rod()
-    if not tool then
-        if autoOwned or held then resetCycle("Aguardando vara perto do lago") end
-        lastRod=nil castCheckAt=os.clock() attemptsSinceCheck=0
-        phase="Aguardando vara perto do lago" return
-    end
-    local focused=nil pcall(function() focused=UIS:GetFocusedTextBox() end)
-    if focused or dragging then release() phase="Pausado enquanto voce usa o painel" castCheckAt=os.clock() return end
-    if tool~=lastRod then release() lastRod=tool castCheckAt=os.clock() attemptsSinceCheck=0 end
-    if modeFault then if not chooseMode("Falha no clique virtual") then return end end
-    local shown,n=progress()
-    if shown then
-        if pulse then release() end
-        if stage~="reeling" and stage~="waitingCaught" then
-            -- A fisgada e o primeiro segurar nao podem ocupar o mesmo frame.
-            release(true) stage="reeling" stateAt=os.clock()
-            geometry={started=os.clock(),releaseUntil=os.clock()+math.min(frameDuration*.75,.03)} completionSent=false
-            phase="Seguindo o peixe automaticamente"
-        end
-        if stage=="reeling" then
-            if n and n>=99.95 and geometry.sawBelowFull then
-                geometry.peak=n stage="waitingCaught" stateAt=os.clock() phase="100%; aguardando captura"
-                controlBar(dt)
-            else controlBar(dt) end
-        elseif stage=="waitingCaught" then
-            phase="100%; aguardando captura"
-            controlBar(dt)
-            if n and n<99 then stage="reeling" stateAt=os.clock() completionSent=false
-            else finishCatch() end
-        end
-        return -- NENHUM clique de spam enquanto a barra estiver visivel.
-    end
-    if stage=="reeling" then
-        release() stage="waitingCaught" stateAt=os.clock()
-    end
-    if stage=="waitingCaught" then
-        finishCatch()
-        if os.clock()-stateAt>4 then recover("Sem confirmacao; soltando e relancando") end
-    end
-    if stage=="idle" then
-        cycle=cycle+1 autoOwned=true stage="casting" stateAt=os.clock() castAt=os.clock()
-        geometry={} completionSent=false phase="Clicando rapido para lancar"
-    end
-    -- Soltar ocupa seu proprio frame. Nenhum novo press vem nesta mesma passagem.
-    if pulse then
-        if pulse.epoch~=inputEpoch or os.clock()>=pulse.releaseAt then release() end
-        return
-    end
-    if stage=="casting" and os.clock()-castCheckAt>8 and attemptsSinceCheck>10 then
-        recover("Lançamento demorou; soltando e tentando novamente")
-    elseif stage=="waitingBite" then
-        phase="Vara lancada; aguardando !"
-        if os.clock()-stateAt>15 then recover("Sem mordida; soltando e tentando relancar") end
-    elseif stage=="hooking" and os.clock()-stateAt>4 then
-        recover("Sem barra; soltando e tentando relancar")
-    end
-    -- Para ao confirmar o lancamento. A proxima entrada e somente na mordida.
-    if stage=="casting" and os.clock()>=nextClick then click()
-    elseif stage=="hooking" and hookAttempts<4 and os.clock()>=nextClick then click("Hook no !") end
-end
-connect(Run.RenderStepped,function(dt)
-    if not enabled then return end
-    local ok,err=pcall(step,dt)
-    if not ok then report.error=tostring(err) toggle(false) phase="Erro. Copie o resultado." end
-    if not enabled then autoButton.Text="Auto Fish: OFF" end
-end)
-local dragInput,inputStart,panelStart
-connect(title.InputBegan,function(input)
+env.DigDebug={Start=start,Stop=stop,Copy=copy,Close=close,TestZone=testZone,GetReport=function() return report end}
+listen(startButton.Activated,start,links)
+listen(stopButton.Activated,function() stop(true) end,links)
+listen(copyButton.Activated,copy,links)
+listen(testButton.Activated,function() testZone() end,links)
+listen(exit.Activated,close,links)
+listen(minimize.Activated,function() mini.Position=panel.Position panel.Visible=false mini.Visible=true end,links)
+listen(mini.Activated,function() panel.Position=mini.Position panel.Visible=true mini.Visible=false end,links)
+local dragging,dragInput,inputStart,panelStart
+listen(title.InputBegan,function(input)
     if input.UserInputType==Enum.UserInputType.Touch or input.UserInputType==Enum.UserInputType.MouseButton1 then
-        dragging=true dragInput=input.UserInputType==Enum.UserInputType.Touch and input or nil
-        inputStart=input.Position panelStart=panel.Position
+        dragging=true dragInput=input.UserInputType==Enum.UserInputType.Touch and input or nil inputStart=input.Position panelStart=panel.Position
     end
-end)
-connect(UIS.InputChanged,function(input)
-    if not dragging then return end
-    if (dragInput and input==dragInput) or (not dragInput and input.UserInputType==Enum.UserInputType.MouseMovement) then
-        local delta=input.Position-inputStart
-        local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
-        panel.Position=UDim2.fromOffset(math.clamp(panelStart.X.Offset+delta.X,0,math.max(0,view.X-312)),
-            math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-262)))
+end,links)
+listen(UIS.InputChanged,function(input)
+    if dragging and ((dragInput and input==dragInput) or (not dragInput and input.UserInputType==Enum.UserInputType.MouseMovement)) then
+        local delta=input.Position-inputStart local view=workspace.CurrentCamera.ViewportSize
+        panel.Position=UDim2.fromOffset(math.clamp(panelStart.X.Offset+delta.X,0,math.max(0,view.X-330)),math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-265)))
     end
-end)
-connect(UIS.InputEnded,function(input) if input==dragInput or input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end)
-task.spawn(function()
-    while alive do label.Text=phase task.wait(.2) end
-end)
-print("Teste de pesca por clique e controle de barra pronto. Inicia OFF.")
+end,links)
+listen(UIS.InputEnded,function(input) if input==dragInput or input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end,links)
+
