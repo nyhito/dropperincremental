@@ -18,7 +18,7 @@ local function current(token) return alive and running and generation==token end
 local started=0
 local links,sessionLinks={},{}
 local own=setmetatable({}, {__mode="k"})
-local report={format="dig-debug-v3-reactive",build="3.1-init-fix",placeId=game.PlaceId}
+local report={format="dig-debug-v3-reactive",build="3.2-instant-tp-dig",placeId=game.PlaceId}
 local refs={objects={}}
 local bound=setmetatable({}, {__mode="k"})
 local pendingButtons={}
@@ -563,9 +563,22 @@ local function serverNow()
     if ok and type(value)=="number" then return value end
     if report.auto then report.auto.clockError="GetServerTimeNow indisponivel" end
 end
-local function sync()
-    if os.clock()-(auto.lastSync or -math.huge)<1 then return end
+local function sync(urgent)
+    local gap=urgent==true and .05 or .25
+    if os.clock()-(auto.lastSync or -math.huge)<gap then return end
     auto.lastSync=os.clock() send("Sync")
+end
+local function requestDig(reason)
+    if not auto.enabled or not running or not auto.spot or auto.layer then return end
+    local now=os.clock()
+    local retry=math.clamp((auto.rtt or .06)*2+.02,.12,.3)
+    if now-(auto.lastDig or -math.huge)<retry then return end
+    auto.lastDig=now auto.phase="Iniciando Dig"
+    report.auto.digs=report.auto.digs+1
+    local transit=report.auto.lastTransit
+    if transit and not transit.digAt then transit.digAt=at() transit.spotToDigMs=math.floor((now-auto.spot.receivedAt)*1000+.5) end
+    autoLog("send","Dig",{reason=reason,spotToDigMs=math.floor((now-auto.spot.receivedAt)*1000+.5)})
+    send("Dig")
 end
 local function jumpToSpot()
     if not auto.enabled or not auto.tp or not auto.spot or auto.jumpedKey==auto.spot.key then return end
@@ -579,8 +592,10 @@ local function jumpToSpot()
         root.AssemblyLinearVelocity=Vector3.new(0,0,0)
     end)
     if ok then
-        auto.jumpedKey=auto.spot.key auto.settleUntil=os.clock()+.12
+        auto.jumpedKey=auto.spot.key
+        if report.auto.lastTransit then report.auto.lastTransit.tpAt=at() end
         report.auto.teleports=report.auto.teleports+1 autoLog("local","TP",vec(target))
+        requestDig("imediatamente_apos_TP")
     else auto.phase="TP indisponivel" autoLog("error","TP",tostring(err):sub(1,120)) end
 end
 onTreasure=function(action,...)
@@ -592,6 +607,7 @@ onTreasure=function(action,...)
         if not auto.spot or auto.spot.key~=key then
             auto.spot={id=args[1],position=target,key=key,receivedAt=os.clock()}
             auto.layer=nil auto.pending=nil auto.lastDig=-math.huge auto.jumpedKey=nil
+            if report.auto then report.auto.lastTransit={spotAt=at(),spotId=args[1]} end
             if auto.enabled then auto.phase="Aguardando alcance para Dig" autoLog("server","Spot",{id=args[1],position=vec(target)}) end
         end
         if report.auto then report.auto.spot={id=args[1],position=vec(target)} end
@@ -640,6 +656,7 @@ onTreasure=function(action,...)
         end
         auto.layer=nil auto.pending=nil auto.spot=nil auto.phase=auto.enabled and "Gamepass buscando o proximo ponto" or "OFF"
         auto.waitingSince=os.clock()
+        if auto.enabled then sync(true) end
     elseif action=="Exit" or action=="Leave" then
         auto.spot=nil auto.layer=nil auto.pending=nil auto.phase=auto.enabled and "Entre na praia com o detector" or "OFF"
     end
@@ -647,7 +664,6 @@ end
 autoStep=function()
     if not auto.enabled or not running then return end
     local now=os.clock()
-    if now<(auto.settleUntil or 0) then return end
     if auto.layer then
         local layer=auto.layer
         if visual or visualPending then auto.phase="Teste verde: toque Dig fora da faixa original" return end
@@ -689,19 +705,17 @@ autoStep=function()
     end
     if not auto.spot then
         auto.phase="Aguardando ponto da gamepass"
-        if now-(auto.waitingSince or now)>.8 then sync() end
+        sync()
         return
     end
     jumpToSpot()
-    if now<(auto.settleUntil or 0) then return end
+    if auto.layer then return end
     local p=position() if not p then auto.phase="Aguardando personagem" return end
     local target=auto.spot.position local dx,dz=p.X-target.X,p.Z-target.Z
     local _,signal=readHud()
     local near=dx*dx+dz*dz<=3.2*3.2
     if not near and (not signal or signal<90) then auto.phase="Gamepass aproximando do ponto" return end
-    if now-(auto.lastDig or -math.huge)<.45 then return end
-    auto.lastDig=now auto.phase="Iniciando Dig"
-    report.auto.digs=report.auto.digs+1 autoLog("send","Dig") send("Dig")
+    requestDig("alcance_confirmado_ou_retentativa")
 end
 toggleAuto=function(value)
     if value==nil then value=not auto.enabled end
@@ -912,7 +926,7 @@ start=function(lightMode)
     bound=setmetatable({}, {__mode="k"}) pendingButtons={} targetKeys={} groupKeys={} remoteInfo={} monitored={}
     lastPhase,lastLayer,lastHud="unknown",nil,"" movement=nil lastPos=nil lastPosAt=nil lastTap=-math.huge
     auto={enabled=false,tp=auto.tp,phase="OFF",waitingSince=os.clock()} visualPending=false
-    report={format="dig-debug-v3-reactive",build="3.1-init-fix",placeId=game.PlaceId,note="Auto por posicao atual do traco, sem clique de tela. TP opcional para Spot. Faixa visual tem teste manual separado e nao prova tolerancia real. Found enquanto ligado nao distingue ajuda manual.",
+    report={format="dig-debug-v3-reactive",build="3.2-instant-tp-dig",placeId=game.PlaceId,note="TP assim que chega Spot e Dig no mesmo ciclo, sem espera fixa. Golpes pela posicao atual do traco. Faixa visual tem teste manual separado. Found enquanto ligado nao distingue ajuda manual.",
         calls={},remoteInventory={},taps={},transitions={},messages={},targets={},movement={},visualTests={},dropped=0,logic={status="scanning",scripts={},signals={},functions={},states={}},world={},tools={}}
     report.auto={enabled=false,tp=auto.tp,digs=0,strikes=0,confirmedHits=0,misses=0,foundWhileEnabled=0,teleports=0,timeouts=0,events={}}
     probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.allowed={} probe.seen={}
