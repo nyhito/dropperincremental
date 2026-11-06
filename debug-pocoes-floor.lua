@@ -1,5 +1,5 @@
 -- Auto Fish / controlador local. Mantem o mesmo nome do arquivo de teste.
--- Lanca e fisga pelo input do cliente e acompanha Fish/Zone ate 100% reais.
+-- Chama somente funcoes locais de entrada; nunca injeta cliques fisicos na tela.
 -- Nao forja Zone, nao altera a UI e nao conta capturas manuais como sucesso do auto.
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -38,11 +38,14 @@ local inputWorking=false
 local modeFault=false
 local autoOwned=false
 local manualAssisted=false
-local virtualInputAt=-math.huge
+local boundFunctions={}
+local dropDebug=nil
+local dropConnection=nil
+local startDropDebug,stopDropDebug
 local geometry={}
 local toggle,close,copy,setHeld,click,chooseMode
-local report={format="fishing-controller-v2",placeId=game.PlaceId,
-    note="Controla entrada local e barra real. Caught so conta no ciclo iniciado/controlado pelo auto. Nao comprova remocao dos tempos de queda/mordida.",
+local report={format="fishing-controller-v3-functions",placeId=game.PlaceId,
+    note="Chama funcoes locais, sem ponteiro virtual. Controla a barra real. Caught so conta no ciclo iniciado/controlado pelo auto. Nao comprova remocao dos tempos de queda/mordida.",
     caught=0,escaped=0,manualOrUnownedCaught=0,manualTouches=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,
     events={},catches={},inputErrors={},capabilities={},recastDelay=0}
 local function connect(signal,fn)
@@ -71,6 +74,11 @@ local function record(kind,action,...)
     local e={t=now(),kind=kind,action=tostring(action):sub(1,90),cycle=cycle,stage=stage}
     local args=table.pack(...)
     if args.n>0 then e.args={} local b={left=18} for i=1,math.min(5,args.n) do e.args[tostring(i)]=safe(args[i],0,b) end end
+    if dropDebug and dropDebug.running and #dropDebug.events<30 then
+        if tostring(action):find("Cast",1,true) or action=="Bite" or tostring(action):find("Hook",1,true) then
+            dropDebug.events[#dropDebug.events+1]=e
+        end
+    end
     report.events[#report.events+1]=e
     if #report.events>32 then table.remove(report.events,1) end
 end
@@ -109,9 +117,15 @@ local function sourceOf(fn,c)
     if not source then pcall(function() if debug and debug.info then source=debug.info(fn,"s") end end) end
     return tostring(source or "")
 end
-local function callbacks(signal)
+local function constantsOf(fn)
+    local reader=debug and debug.getconstants
+    if type(reader)~="function" then return {} end
+    local ok,result=pcall(reader,fn)
+    return ok and type(result)=="table" and result or {}
+end
+local function callbacks(signal,origin)
     local list=getconnections or env.getconnections
-    if type(list)~="function" then return {} end
+    if type(list)~="function" or not signal then return {} end
     local ok,all=pcall(list,signal)
     if not ok or type(all)~="table" then return {} end
     local candidates,best={},0
@@ -123,11 +137,22 @@ local function callbacks(signal)
             local score=(lower:find("playerscripts.client.main",1,true) and 100)
                 or (lower:find("playerscripts",1,true) and lower:find("fish",1,true) and 80)
                 or (lower:find("client.main",1,true) and 70) or 0
-            if score>0 then candidates[#candidates+1]={fn=fn,source=source,score=score} best=math.max(best,score) end
+            if score==0 then
+                -- Alguns executores nao expoem o caminho da closure. Usa a assinatura da pesca.
+                local hit,fish=false,false
+                for _,v in pairs(constantsOf(fn)) do
+                    if type(v)=="string" then
+                        if v=="Fishing" or v=="ReelBar" then fish=true end
+                        if v=="Cast" or v=="Hook" or v=="Catch" or v=="FishingRod" then hit=true end
+                    end
+                end
+                if fish and hit then score=60 end
+            end
+            if score>0 then candidates[#candidates+1]={fn=fn,source=source,score=score,origin=origin} best=math.max(best,score) end
         end
     end
     local selected={}
-    for _,c in ipairs(candidates) do if c.score==best then selected[#selected+1]=c end end
+    for _,c in ipairs(candidates) do if c.score==best then selected[#selected+1]=c boundFunctions[c.fn]=c end end
     return selected
 end
 local function inputError(message)
@@ -141,7 +166,7 @@ local function position()
 end
 local function refreshModes()
     modes={}
-    local begins,ends=callbacks(UIS.InputBegan),callbacks(UIS.InputEnded)
+    local begins,ends=callbacks(UIS.InputBegan,"InputBegan"),callbacks(UIS.InputEnded,"InputEnded")
     report.bindings={began={},ended={}}
     for _,c in ipairs(begins) do report.bindings.began[#report.bindings.began+1]=c.source end
     for _,c in ipairs(ends) do report.bindings.ended[#report.bindings.ended+1]=c.source end
@@ -170,21 +195,23 @@ local function refreshModes()
             end}
         end
     end
-    pcall(function()
-        local vim=game:GetService("VirtualInputManager")
-        if vim then modes[#modes+1]={name="VirtualInput",press=function(down)
-            local x,y=position()
-            virtualInputAt=os.clock()
-            vim:SendMouseButtonEvent(x,y,0,down,game,0)
-        end} end
-    end)
     local tool=rod()
-    if tool then modes[#modes+1]={name="FishingRod.Activate",press=function(down)
-        local r=rod() or tool
-        if down then r:Activate() else r:Deactivate() end
-    end} end
+    if tool then
+        local beginsTool,endsTool=callbacks(tool.Activated,"Tool.Activated"),callbacks(tool.Deactivated,"Tool.Deactivated")
+        if #beginsTool>0 and #endsTool>0 then
+            modes[#modes+1]={name="FishingRod / funcoes locais",press=function(down)
+                local selected=down and beginsTool or endsTool
+                local epoch=inputEpoch
+                for _,binding in ipairs(selected) do task.spawn(function()
+                    if down and (not alive or not enabled or epoch~=inputEpoch) then return end
+                    local ok,err=pcall(binding.fn)
+                    if not ok then inputError(err) end
+                end) end
+            end}
+        end
+    end
     modeIndex=1 modeFault=false
-    report.capabilities={getconnections=type(getconnections or env.getconnections)=="function",inputModes=#modes}
+    report.capabilities={getconnections=type(getconnections or env.getconnections)=="function",getconstants=debug and type(debug.getconstants)=="function",getupvalues=debug and type(debug.getupvalues)=="function",inputModes=#modes,physicalInput=false}
 end
 setHeld=function(down,force)
     if down and (not alive or not enabled) then return false end
@@ -207,7 +234,7 @@ chooseMode=function(reason)
     record("input","Switch",reason)
     modeIndex=modeIndex+1
     if modeIndex>#modes then
-        enabled=false phase="Sem controle de clique confirmado. Copie o resultado."
+        enabled=false phase="Funcao local nao confirmada. Copie o resultado."
         return false
     end
     report.inputMode=modes[modeIndex].name
@@ -229,7 +256,7 @@ end
 -- Painel de teste independente: ligado/desligado, intervalo e resultado para retorno.
 local gui=Instance.new("ScreenGui") gui.Name="FishingControllerTest" gui.ResetOnSpawn=false gui.DisplayOrder=10031
  gui.Parent=player:WaitForChild("PlayerGui")
-local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(312,224) panel.Position=UDim2.new(0,12,0.15,0)
+local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(312,262) panel.Position=UDim2.new(0,12,0.15,0)
  panel.BackgroundColor3=Color3.fromRGB(21,23,30) panel.Parent=gui
 Instance.new("UICorner",panel).CornerRadius=UDim.new(0,9)
 local function button(text,x,y,w,h)
@@ -238,7 +265,7 @@ local function button(text,x,y,w,h)
     b.Position=UDim2.fromOffset(x,y) b.Size=UDim2.fromOffset(w,h) b.Parent=panel
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,6) return b
 end
-local title=Instance.new("TextLabel") title.Text="AUTO FISH / CLIQUE E BARRA" title.Font=Enum.Font.GothamBold title.TextSize=13
+local title=Instance.new("TextLabel") title.Text="AUTO FISH / FUNCOES LOCAIS" title.Font=Enum.Font.GothamBold title.TextSize=13
  title.TextColor3=Color3.new(1,1,1) title.BackgroundTransparency=1 title.Active=true
  title.Position=UDim2.fromOffset(10,3) title.Size=UDim2.fromOffset(224,30) title.Parent=panel
 local minimize=button("-",242,6,26,26) local exit=button("X",276,6,26,26)
@@ -250,10 +277,11 @@ local intervalBox=Instance.new("TextBox") intervalBox.Text="0" intervalBox.Clear
  intervalBox.TextColor3=Color3.new(1,1,1) intervalBox.BackgroundColor3=Color3.fromRGB(35,37,46)
  intervalBox.Position=UDim2.fromOffset(206,85) intervalBox.Size=UDim2.fromOffset(96,30) intervalBox.Parent=panel
 local copyButton=button("Copiar resultado",10,123,292,31)
+local dropButton=button("Debug queda (12 s)",10,161,292,31)
 local label=Instance.new("TextLabel") label.Text="Chegue perto do lago e ative."
  label.TextWrapped=true label.TextXAlignment=Enum.TextXAlignment.Left label.TextYAlignment=Enum.TextYAlignment.Top
  label.Font=Enum.Font.Gotham label.TextSize=12 label.TextColor3=Color3.new(1,1,1) label.BackgroundTransparency=1
- label.Position=UDim2.fromOffset(10,164) label.Size=UDim2.fromOffset(292,53) label.Parent=panel
+ label.Position=UDim2.fromOffset(10,200) label.Size=UDim2.fromOffset(292,53) label.Parent=panel
 local mini=Instance.new("TextButton") mini.Text="PESCA" mini.Font=Enum.Font.GothamBold mini.TextSize=12
  mini.TextColor3=Color3.new(1,1,1) mini.BackgroundColor3=Color3.fromRGB(66,49,110)
  mini.Position=panel.Position mini.Size=UDim2.fromOffset(70,38) mini.Visible=false mini.Parent=gui
@@ -261,7 +289,152 @@ Instance.new("UICorner",mini).CornerRadius=UDim.new(0,8)
 local output=Instance.new("TextBox") output.Text="" output.MultiLine=true output.TextWrapped=true output.ClearTextOnFocus=false
  output.Font=Enum.Font.Code output.TextSize=10 output.TextColor3=Color3.new(1,1,1) output.BackgroundColor3=Color3.fromRGB(29,31,39)
  output.TextXAlignment=Enum.TextXAlignment.Left output.TextYAlignment=Enum.TextYAlignment.Top
- output.Position=UDim2.fromOffset(0,230) output.Size=UDim2.fromOffset(312,135) output.Visible=false output.Parent=panel
+ output.Position=UDim2.fromOffset(0,268) output.Size=UDim2.fromOffset(312,135) output.Visible=false output.Parent=panel
+-- Diagnostico opcional da queda. Somente leitura; nao altera closures, tweens ou posicoes.
+local function dropRelevant(s)
+    s=tostring(s):lower()
+    for _,word in ipairs({"cast","fish","rod","bait","bobber","float","bite","hook","reel","tween","duration","delay","travel","flight","gravity","velocity","fall","drop","animation","lerp"}) do
+        if s:find(word,1,true) then return true end
+    end
+    return false
+end
+stopDropDebug=function(shouldCopy)
+    local d=dropDebug
+    if not d or not d.running then return end
+    d.running=false d.seconds=now()-d.started
+    if dropConnection then dropConnection:Disconnect() dropConnection=nil end
+    dropButton.Text="Debug queda (12 s)"
+    report.dropDebug=d
+    if shouldCopy and copy then copy() end
+end
+startDropDebug=function()
+    if not alive or (dropDebug and dropDebug.running) then return end
+    local d={running=true,started=now(),events={},functions={},parts={},states={},capabilities={
+        getconstants=debug and type(debug.getconstants)=="function",
+        getupvalues=debug and type(debug.getupvalues)=="function"}}
+    dropDebug=d report.dropDebug=d
+    dropButton.Text="Parar debug / copiar"
+    local physical,stateSources,fnSeen={},{},{}
+    local function watch(obj)
+        if typeof(obj)~="Instance" or not obj:IsA("BasePart") then return end
+        for _,entry in ipairs(physical) do if entry.obj==obj then return end end
+        local name=obj.Name:lower()
+        local priority=name:find("bobber",1,true) or name:find("bait",1,true) or name:find("float",1,true)
+        if #physical>=6 then
+            if not priority then return end
+            local replace
+            for i,entry in ipairs(physical) do if not entry.priority then replace=i break end end
+            if not replace then return end
+            table.remove(physical,replace) table.remove(d.parts,replace)
+        end
+        local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if root and (obj.Position-root.Position).Magnitude>90 then return end
+        local entry={path=obj:GetFullName(),class=obj.ClassName,samples={}}
+        physical[#physical+1]={obj=obj,data=entry,priority=priority}
+        d.parts[#d.parts+1]=entry
+    end
+    local function maybeWatch(obj)
+        local p=obj local related=false
+        for _=1,4 do
+            if not p or p==workspace or p==game then break end
+            local n=p.Name:lower()
+            if n:find("bobber",1,true) or n:find("bait",1,true) or n:find("float",1,true) or n:find("fishingrod",1,true) then related=true break end
+            p=p.Parent
+        end
+        if related then watch(obj) end
+    end
+    dropConnection=workspace.DescendantAdded:Connect(function(obj) if d.running then maybeWatch(obj) end end)
+    local tool=rod()
+    if tool then for i,obj in ipairs(tool:GetDescendants()) do if i>80 then break end maybeWatch(obj) end end
+    local function stateTable(value)
+        local out,n={},0
+        for k,v in next,value do
+            n=n+1 if n>60 then break end
+            if dropRelevant(k) then out[tostring(k)]=safe(v,0,{left=8}) end
+        end
+        return next(out) and out or nil
+    end
+    boundFunctions={}
+    callbacks(UIS.InputBegan,"InputBegan")
+    callbacks(UIS.InputEnded,"InputEnded")
+    if tool then callbacks(tool.Activated,"Tool.Activated") callbacks(tool.Deactivated,"Tool.Deactivated") end
+    local queue={}
+    for fn,entry in pairs(boundFunctions) do queue[#queue+1]={fn=fn,origin=entry.origin or "Input",depth=0} end
+    for _,entry in ipairs(callbacks(fishing.OnClientEvent,"Fishing.OnClientEvent")) do queue[#queue+1]={fn=entry.fn,origin=entry.origin,depth=0} end
+    task.spawn(function()
+        local index=1
+        while alive and d.running and index<=#queue and #d.functions<12 do
+            local item=queue[index] index=index+1
+            if not fnSeen[item.fn] then
+                fnSeen[item.fn]=true
+                local name="" pcall(function() if debug and debug.info then name=debug.info(item.fn,"n") end end)
+                local entry={origin=item.origin,name=name,source=sourceOf(item.fn,{}),constants={},upvalues={}}
+                local const=constantsOf(item.fn)
+                for k,v in pairs(const) do
+                    if #entry.constants>=18 then break end
+                    if type(v)=="number" or (type(v)=="string" and dropRelevant(v)) then
+                        entry.constants[#entry.constants+1]={index=k,value=safe(v,0,{left=2})}
+                    end
+                end
+                local reader=debug and debug.getupvalues
+                if type(reader)=="function" then
+                    local ok,values=pcall(reader,item.fn)
+                    if ok and type(values)=="table" then
+                        local inspected=0
+                        for key,v in pairs(values) do
+                            inspected=inspected+1 if inspected>40 then break end
+                            local kind=typeof(v)
+                            if type(v)=="function" and item.depth<2 and #queue<32 then
+                                queue[#queue+1]={fn=v,origin=tostring(item.origin).."/uv"..tostring(key),depth=item.depth+1}
+                            elseif kind=="table" then
+                                local snap=stateTable(v)
+                                if snap then
+                                    if #stateSources<4 then stateSources[#stateSources+1]={value=v,origin=item.origin,key=tostring(key)} end
+                                    if #entry.upvalues<8 then entry.upvalues[#entry.upvalues+1]={key=tostring(key),type=kind,value=snap} end
+                                end
+                            elseif kind=="Instance" then
+                                if dropRelevant(v.Name) then watch(v) end
+                                if dropRelevant(v.Name) and #entry.upvalues<8 then entry.upvalues[#entry.upvalues+1]={key=tostring(key),value=safe(v,0,{left=3})} end
+                            elseif kind=="number" or kind=="Vector3" or (kind=="string" and dropRelevant(v)) then
+                                if #entry.upvalues<8 then entry.upvalues[#entry.upvalues+1]={key=tostring(key),type=kind,value=safe(v,0,{left=4})} end
+                            end
+                        end
+                    end
+                end
+                d.functions[#d.functions+1]=entry
+            end
+            if index%3==0 then task.wait() end
+        end
+    end)
+    task.spawn(function()
+        while alive and d.running and now()-d.started<12 do
+            local t=now()-d.started
+            for _,entry in ipairs(physical) do
+                local obj=entry.obj
+                if obj.Parent then
+                    local pos=obj.Position
+                    local last=entry.last
+                    if not last or (pos-last).Magnitude>.03 then
+                        local sample={t=t,x=pos.X,y=pos.Y,z=pos.Z}
+                        local samples=entry.data.samples
+                        if #samples<12 then samples[#samples+1]=sample else samples[12]=sample end
+                        entry.last=pos
+                    end
+                end
+            end
+            if #d.states<8 and #stateSources>0 then
+                local snapshot={t=t,values={}}
+                for _,source in ipairs(stateSources) do
+                    snapshot.values[#snapshot.values+1]={origin=source.origin,key=source.key,value=stateTable(source.value)}
+                end
+                if t>=(d.nextState or 0) then d.states[#d.states+1]=snapshot d.nextState=t+1.5 end
+            end
+            task.wait(.1)
+        end
+        if alive and d.running then stopDropDebug(true) end
+    end)
+end
+
 local function resetCycle(reason)
     release()
     cycle=cycle+1 stage="idle" stateAt=os.clock() castAt=nil biteAt=nil hookAt=nil
@@ -312,7 +485,11 @@ local function controlBar(dt)
     report.controller={t=now(),fish=fx,zone=zx,width=zw,held=held,inside=g.inside,peak=g.peak,inputWorking=inputWorking}
 end
 local function onServer(action,...)
-    if not alive or not enabled then return end
+    if not alive then return end
+    if not enabled then
+        if dropDebug and dropDebug.running then record("server",action,...) end
+        return
+    end
     local args=table.pack(...)
     record("server",action,...)
     if action=="Cast" then
@@ -351,8 +528,6 @@ connect(fishing.OnClientEvent,onServer)
 connect(UIS.InputBegan,function(input,processed)
     if not enabled or processed or not autoOwned then return end
     if input.UserInputType~=Enum.UserInputType.Touch and input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
-    local mode=modes[modeIndex]
-    if mode and mode.name=="VirtualInput" and os.clock()-virtualInputAt<.12 then return end
     manualAssisted=true report.manualTouches=report.manualTouches+1
 end)
 toggle=function(value)
@@ -361,7 +536,7 @@ toggle=function(value)
     release()
     enabled=value==true
     resetCycle(enabled and "Chegue perto do lago" or "OFF")
-    if enabled then refreshModes() if #modes==0 then enabled=false phase="Sem input disponivel. Copie o resultado." end end
+    if enabled then refreshModes() if #modes==0 then enabled=false phase="Sem funcao de entrada acessivel. Copie o resultado." end end
     autoButton.Text=enabled and "Auto Fish: ON" or "Auto Fish: OFF"
 end
 copy=function()
@@ -369,7 +544,30 @@ copy=function()
     report.hasRod=rod()~=nil
     local shown,n=progress()
     report.ui={barVisible=shown,percent=n}
-    local payload=Http:JSONEncode(report)
+    local export={}
+    for k,v in pairs(report) do export[k]=v end
+    local payload=Http:JSONEncode(export)
+    if #payload>18000 and report.dropDebug then
+        local d={} for k,v in pairs(report.dropDebug) do if k~="connection" then d[k]=v end end
+        d.states=nil export.dropDebug=d export.trimmed=true export.events=nil
+        payload=Http:JSONEncode(export)
+        if #payload>18000 then
+            local functions={}
+            for _,fn in ipairs(d.functions) do functions[#functions+1]={origin=fn.origin,name=fn.name,source=fn.source,constants=fn.constants} end
+            d.functions=functions payload=Http:JSONEncode(export)
+        end
+        if #payload>18000 then
+            local partSummary={}
+            for _,part in ipairs(d.parts) do
+                local samples={}
+                for i,sample in ipairs(part.samples) do if i<=3 or i>#part.samples-3 then samples[#samples+1]=sample end end
+                partSummary[#partSummary+1]={path=part.path,class=part.class,samples=samples}
+            end
+            d.parts=partSummary
+            local ev={} for i,event in ipairs(d.events) do if i<=5 or i>#d.events-5 then ev[#ev+1]=event end end d.events=ev
+            payload=Http:JSONEncode(export)
+        end
+    end
     env.FishingAutoTestReport=payload
     local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard
     local ok,result=false,nil
@@ -380,13 +578,15 @@ copy=function()
 end
 close=function()
     if not alive then return end
+    if dropDebug and dropDebug.running then stopDropDebug(false) end
     toggle(false) alive=false
     for _,c in ipairs(links) do c:Disconnect() end
     gui:Destroy()
 end
-env.FishingAutoTest={Toggle=toggle,Copy=copy,Close=close,Report=report}
+env.FishingAutoTest={Toggle=toggle,Copy=copy,Close=close,Report=report,StartDropDebug=function() startDropDebug() end,StopDropDebug=function() stopDropDebug(true) end}
 connect(autoButton.Activated,function() toggle() end)
 connect(copyButton.Activated,copy)
+connect(dropButton.Activated,function() if dropDebug and dropDebug.running then stopDropDebug(true) else startDropDebug() end end)
 connect(exit.Activated,close)
 connect(minimize.Activated,function() mini.Position=panel.Position panel.Visible=false mini.Visible=true end)
 connect(mini.Activated,function() panel.Position=mini.Position panel.Visible=true mini.Visible=false end)
@@ -405,7 +605,7 @@ local function step(dt)
     end
     if tool~=lastRod then
         release() refreshModes() lastRod=tool
-        if #modes==0 then enabled=false phase="Sem input disponivel. Copie o resultado." return end
+        if #modes==0 then enabled=false phase="Sem funcao de entrada acessivel. Copie o resultado." return end
     end
     if modeFault then
         if not chooseMode("Falha no callback de entrada") then return end
@@ -473,7 +673,7 @@ connect(UIS.InputChanged,function(input)
         local delta=input.Position-inputStart
         local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
         panel.Position=UDim2.fromOffset(math.clamp(panelStart.X.Offset+delta.X,0,math.max(0,view.X-312)),
-            math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-224)))
+            math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-262)))
     end
 end)
 connect(UIS.InputEnded,function(input) if input==dragInput or input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end)
