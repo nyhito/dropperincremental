@@ -55,7 +55,7 @@ Library.NotifyOnError=true
 local viewport=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
 local Window=Library:CreateWindow({
     Title="Neto Hub",
-    Footer="Neto Hub | v2.1 | Obsidian UI",
+    Footer="Neto Hub | v2.2 | Obsidian UI",
     Icon="triangle",
     Center=true,
     AutoShow=true,
@@ -135,6 +135,9 @@ local tree=newFeature("Tree","Auto Tree",0.05)
 local spam=newFeature("Spam","Spam Button",0.05)
 local potions=newFeature("Potions","Buy Potions",10)
 local floorUpgrades=newFeature("Floor","Floor Upgrades",0)
+local autoFish=newFeature("Fishing","Auto Fish",.001)
+local antiAFK=newFeature("AntiAFK","Anti-AFK",0)
+antiAFK.default=true
 coins.batch,coins.retry=25,3
 coins.pending=setmetatable({}, {__mode="k"})
 coins.visible=0
@@ -1011,6 +1014,612 @@ removePanelEntry=function(id)
     end
 end
 
+-- Controlador de pesca incorporado; sem janela secundaria ou download do debug.
+local function createFishingController(onChanged)
+local UIS=game:GetService("UserInputService")
+local Run=game:GetService("RunService")
+local fishing,fishingConnection=nil,nil
+local function overlayParent()
+    for gui in pairs(ownedGuis) do if gui.Parent then return gui.Parent end end
+    return player:FindFirstChild("PlayerGui")
+end
+local alive,enabled=true,false
+local links={}
+local started=os.clock()
+local phase,stage="OFF","idle"
+local cycle,stateAt=0,os.clock()
+local rodCache,uiCache=nil,nil
+local castAt,biteAt,hookAt=nil,nil,nil
+local interval=0.001
+local lastClick,nextClick=-math.huge,0
+local castCheckAt,attemptsSinceCheck=0,0
+local pulse=nil
+local frameDuration=1/60
+local lastRecovery=-math.huge
+local hookAttempts=0
+local completionSent,held=false,false
+local inputEpoch,injecting=0,0
+local activeInput=nil
+local virtualInputAt=-math.huge
+local virtualX,virtualY=nil,nil
+local modes,modeIndex={},1
+local modeFault,inputWorking=false,false
+local autoOwned=false
+local geometry={}
+local toggle,close,setHeld,click,chooseMode
+local restoreMobile
+local mobileToken={}
+env.__NetoFishingMobileToken=mobileToken
+local mobileDevice=false
+pcall(function() mobileDevice=UIS.TouchEnabled==true end)
+local restoreGeneration=0
+local report={format="fishing-controller-v9-reactive-mobile",placeId=game.PlaceId,
+    note="Conta Caught recebido enquanto ligado; nao distingue ajuda manual. Clica ate confirmar Cast, espera Bite e fisga. Barra acompanhada desde a abertura. Queda/mordida nao removidas.",
+    caught=0,escaped=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,recoveries=0,holdResyncs=0,
+    events={},catches={},inputErrors={},capabilities={},interval=interval}
+local function connect(signal,fn)
+    ownCallbacks[fn]=true
+    local c=signal:Connect(fn) links[#links+1]=c return c
+end
+local function now() return math.floor((os.clock()-started)*1000+.5)/1000 end
+local function safe(v,depth,budget)
+    budget.left=budget.left-1
+    if budget.left<0 then return "[limit]" end
+    local kind=typeof(v)
+    if kind=="nil" then return {type="nil"} end
+    if kind=="string" then return v:sub(1,140) end
+    if kind=="boolean" then return v end
+    if kind=="number" then return v==v and v~=math.huge and v~=-math.huge and v or tostring(v) end
+    if kind=="Instance" then return {type=kind,path=v:GetFullName()} end
+    if kind=="Vector3" then return {type=kind,x=v.X,y=v.Y,z=v.Z} end
+    if kind=="table" and depth<2 then
+        local out,n={},0
+        for k,x in pairs(v) do n=n+1 if n>6 or budget.left<=0 then break end out[tostring(k)]=safe(x,depth+1,budget) end
+        return out
+    end
+    return {type=kind,value=tostring(v):sub(1,140)}
+end
+local function record(kind,action,...)
+    local e={t=now(),kind=kind,action=tostring(action):sub(1,90),cycle=cycle,stage=stage}
+    local args=table.pack(...)
+    if args.n>0 then e.args={} local b={left=18} for i=1,math.min(5,args.n) do e.args[tostring(i)]=safe(args[i],0,b) end end
+    report.events[#report.events+1]=e
+    if #report.events>32 then table.remove(report.events,1) end
+end
+local function rod()
+    local c=player.Character
+    if not c then return end
+    local h=c:FindFirstChild("Humanoid") if h and h.Health<=0 then return end
+    if rodCache and rodCache.Parent==c then return rodCache end
+    local t=c:FindFirstChild("FishingRod")
+    rodCache=t and t.Parent==c and t:IsA("Tool") and t or nil
+    return rodCache
+end
+local function reelBar()
+    if uiCache and uiCache.Parent then return uiCache end
+    local pg=player:FindFirstChild("PlayerGui")
+    local front=pg and pg:FindFirstChild("Front")
+    local main=front and front:FindFirstChild("MainFrame")
+    uiCache=main and main:FindFirstChild("ReelBar")
+    return uiCache
+end
+local function progress()
+    local bar=reelBar()
+    local text=bar and bar:FindFirstChild("Percent")
+    local value=text and tonumber(((text.Text:match("[%d.,]+") or ""):gsub(",",".")))
+    return bar and bar.Visible or false,value
+end
+local clickPoint={x=nil,y=nil,at=-math.huge,vx=0,vy=0}
+local pointBlocked=false
+local function pointIsFree(x,y)
+    local checked={}
+    for _,root in ipairs(rootList) do
+        if root and root~=workspace and not checked[root] then
+            checked[root]=true
+            local ok,hits=pcall(function() return root:GetGuiObjectsAtPosition(x,y) end)
+            if ok and type(hits)=="table" then
+                for _,obj in ipairs(hits) do
+                    if ownUI(obj) then return false end
+                    local a=obj
+                    for _=1,10 do
+                        if not a or a==root then break end
+                        if a:IsA("GuiButton") or a:IsA("TextBox") then return false end
+                        if a.Name=="NetoFishingMobileRestore" then return false end
+                        a=a.Parent
+                    end
+                end
+            end
+        end
+    end
+    return true
+end
+local function position()
+    local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
+    if os.clock()-clickPoint.at<.35 and view.X==clickPoint.vx and view.Y==clickPoint.vy then
+        return clickPoint.x,clickPoint.y
+    end
+    clickPoint.at=os.clock() clickPoint.vx=view.X clickPoint.vy=view.Y
+    clickPoint.x,clickPoint.y=nil,nil
+    for _,point in ipairs({{.78,.30},{.94,.32},{.985,.24},{.985,.42},{.995,.55},{.65,.36},{.53,.34},{.42,.38},{.78,.47},{.6,.48},{.52,.21},{.42,.23}}) do
+        local x,y=math.floor(view.X*point[1]),math.floor(view.Y*point[2])
+        if pointIsFree(x,y) then clickPoint.x=x clickPoint.y=y break end
+    end
+    return clickPoint.x,clickPoint.y
+end
+local function inputError(message)
+    modeFault=true
+    report.inputErrors[#report.inputErrors+1]={t=now(),mode=modes[modeIndex] and modes[modeIndex].name,error=tostring(message):sub(1,230)}
+    if #report.inputErrors>6 then table.remove(report.inputErrors,1) end
+end
+local function refreshModes()
+    modes={} modeIndex=1 modeFault=false
+    local virtual
+    pcall(function() virtual=game:GetService("VirtualInputManager") end)
+    if virtual then
+        modes[#modes+1]={name="VirtualInput / clique na tela",press=function(down)
+            local point=activeInput
+            if not point then return end
+            virtualInputAt=os.clock() virtualX=point.x virtualY=point.y
+            virtual:SendMouseButtonEvent(point.x,point.y,0,down,game,0)
+        end}
+    end
+    local press=mouse1press or env.mouse1press
+    local unpress=mouse1release or env.mouse1release
+    if type(press)=="function" and type(unpress)=="function" then
+        modes[#modes+1]={name="Executor / pressionar e soltar",press=function(down)
+            virtualInputAt=os.clock()
+            if down then press() else unpress() end
+        end}
+    end
+    report.capabilities={screenInput=true,virtualInput=virtual~=nil,executorMouse=type(press)=="function" and type(unpress)=="function",inputModes=#modes}
+end
+setHeld=function(down,force)
+    if down and (not alive or not enabled) then return false end
+    if held==down and not force then return true end
+    local mode=modes[modeIndex]
+    if not mode then return false end
+    if down then
+        local x,y=position()
+        if not x then pointBlocked=true return false end
+        pointBlocked=false activeInput={x=x,y=y}
+    end
+    -- Marca antes do evento: Cast/Hook podem retornar durante o proprio callback.
+    held=down
+    injecting=injecting+1
+    local ok,err=pcall(mode.press,down)
+    injecting=injecting-1
+    if not ok then
+        held=false
+        if down then pcall(mode.press,false) end
+        inputError(err) return false
+    end
+    report.holdChanges=report.holdChanges+1 report.inputMode=mode.name
+    if not down then activeInput=nil end
+    return true
+end
+local function release(force)
+    inputEpoch=inputEpoch+1
+    pulse=nil
+    if force and not activeInput then
+        local x,y=virtualX,virtualY
+        if not x then x,y=position() end
+        if x then activeInput={x=x,y=y} end
+    end
+    if held or (force and activeInput) then setHeld(false,true) end
+    held=false activeInput=nil
+end
+chooseMode=function(reason)
+    -- Troca somente depois de erro real da API, nunca por demora do servidor ou borda da barra.
+    release(true) record("input","Switch",reason)
+    modeIndex=modeIndex+1
+    if modeIndex>#modes then
+        enabled=false phase="Clique virtual indisponivel. Copie o resultado."
+        if restoreMobile then restoreMobile() end
+        return false
+    end
+    modeFault=false inputWorking=false castCheckAt=os.clock() attemptsSinceCheck=0
+    report.inputMode=modes[modeIndex].name
+    return true
+end
+click=function(reason)
+    if not alive or not enabled then return false end
+    local shown=progress()
+    if shown then return false end -- Nunca mistura spam com o controle da barra.
+    local x=position()
+    if not x then release() phase="Ponto de clique coberto pela interface" return false end
+    if pulse or held then return false end
+    lastClick=os.clock() nextClick=lastClick+interval
+    local epoch=inputEpoch
+    if not setHeld(true) then return false end
+    report.clicks=report.clicks+1 attemptsSinceCheck=attemptsSinceCheck+1
+    if stage=="hooking" then hookAttempts=hookAttempts+1 nextClick=lastClick+math.max(interval,.18) end
+    if reason then record("input",reason) end
+    -- Um frame pressionado e outro solto. Evita que o mobile junte os dois estados.
+    -- A soltura e processada no RenderStepped, sem tasks atrasadas de cliques antigos.
+    if enabled and epoch==inputEpoch then pulse={releaseAt=os.clock()+.008,epoch=epoch} end
+    return true
+end
+local function resetCycle(reason)
+    release()
+    cycle=cycle+1 stage="idle" stateAt=os.clock() castAt=nil biteAt=nil hookAt=nil
+    autoOwned=false completionSent=false geometry={} hookAttempts=0
+    nextClick=os.clock()+math.min(frameDuration,.04) phase=reason or "Aguardando"
+end
+local function controlBar(dt)
+    local bar=reelBar()
+    local track=bar and bar:FindFirstChild("Track")
+    local lane=track and track:FindFirstChild("Lane")
+    local zone=lane and lane:FindFirstChild("Zone")
+    local fish=lane and lane:FindFirstChild("Fish")
+    if not lane or not zone or not fish or lane.AbsoluteSize.X<=0 or zone.AbsoluteSize.X<=0 then
+        phase="Aguardando os elementos da barra" return
+    end
+    local left,width=lane.AbsolutePosition.X,lane.AbsoluteSize.X
+    local zx=(zone.AbsolutePosition.X+zone.AbsoluteSize.X*.5-left)/width
+    local fx=(fish.AbsolutePosition.X+fish.AbsoluteSize.X*.5-left)/width
+    local zw=math.clamp(zone.AbsoluteSize.X/width,.01,1)
+    dt=math.clamp(dt or 1/60,.004,.08)
+    local t=os.clock() local g=geometry
+    g.started=g.started or t
+    local movement=g.zone and zx-g.zone or 0
+    local zv=g.zone and movement/dt or 0
+    local fv=g.fish and (fx-g.fish)/dt or 0
+    g.zv=(g.zv or 0)*.45+math.clamp(zv,-4,4)*.55
+    g.fv=(g.fv or 0)*.6+math.clamp(fv,-4,4)*.4
+    -- O centro da zona nao pode ultrapassar as bordas reais da pista.
+    local minX,maxX=zw*.5,1-zw*.5
+    local target=math.clamp(fx+g.fv*.025,minX,maxX)
+    local projected=zx+g.zv*.03
+    local error=target-projected
+    local dead=math.clamp(zw*.015,.0025,.007)
+    local desired=held
+    if error>dead then desired=true elseif error< -dead then desired=false end
+    local wanted=desired
+    if g.releaseUntil and t<g.releaseUntil then desired=false end
+    if desired~=held then g.commandAt=t end
+    if not setHeld(desired) then
+        if pointBlocked then phase="Ponto de clique coberto pela interface" g.lastMove=t
+        elseif chooseMode("Segurar/soltar recusado") then setHeld(desired,true) end
+    end
+    if math.abs(movement)>.0006 then
+        g.lastMove=t inputWorking=true
+        if not g.firstResponseAt and ((wanted and movement>0) or (not wanted and movement<0)) then g.firstResponseAt=t end
+    end
+    g.lastMove=g.lastMove or t
+    local atLimit=(wanted and zx>=maxX-.04) or (not wanted and zx<=minX+.04)
+    local needsMotion=math.abs(error)>math.max(dead*2,.012)
+    local wrongWay=(wanted and g.zv<-.08) or (not wanted and g.zv>.08)
+    local commandSettled=t-(g.commandAt or g.started)>.12
+    -- Detecta comando perdido inclusive quando o peixe ainda esta DENTRO da zona larga.
+    if needsMotion and not atLimit and commandSettled and (t-g.lastMove>.16 or wrongWay)
+        and t-(g.lastResync or -math.huge)>.3 then
+        release(true) g.commandAt=t g.lastResync=t g.lastMove=t
+        g.releaseUntil=t+math.min(frameDuration*.75,.03)
+        report.holdResyncs=report.holdResyncs+1
+    end
+    g.zone,g.fish,g.width=zx,fx,zw
+    g.error=error g.inside=math.abs(fx-zx)<=zw*.5
+    local _,percent=progress()
+    if percent then g.peak=math.max(g.peak or 0,percent) if percent<99 then g.sawBelowFull=true end end
+    report.controller={t=now(),fish=fx,zone=zx,width=zw,held=held,inside=g.inside,peak=g.peak,inputWorking=inputWorking,
+        firstResponseMs=g.firstResponseAt and math.floor((g.firstResponseAt-g.started)*1000+.5)}
+end
+local function onServer(action,...)
+    if not alive then return end
+    if enabled then record("server",action,...) end
+    if not enabled then return end
+    local args=table.pack(...)
+    if action=="Cast" then
+        if autoOwned and rod() then
+            stage="waitingBite" stateAt=os.clock()
+            castAt=castAt or os.clock() inputWorking=true castCheckAt=os.clock()
+            report.castsAccepted=report.castsAccepted+1
+            release(true) phase="Vara lancada; aguardando !"
+        end
+    elseif action=="Bite" then
+        report.bites=report.bites+1 biteAt=os.clock()
+        if autoOwned and rod() then
+            stage="hooking" stateAt=os.clock() phase="Fisgando"
+            hookAt=os.clock() hookAttempts=0 release(true) nextClick=os.clock()+math.min(frameDuration,.04)
+            record("input","Hook agendado no !")
+        end
+    elseif action=="Caught" then
+        -- Touch sintetico no mobile nao identifica autoria. Conta apenas o evento real,
+        -- sem classificar centenas de eventos injetados como intervencao manual.
+        report.caught=report.caught+1
+            report.catches[#report.catches+1]={t=now(),fish=safe(args[1],0,{left=8}),value2=safe(args[2],0,{left=8}),
+                value3=safe(args[3],0,{left=8}),autoFlag=args[4],seconds=castAt and os.clock()-castAt,
+                localPeak=geometry.peak,mode=modes[modeIndex] and modes[modeIndex].name,
+                firstResponseMs=geometry.firstResponseAt and math.floor((geometry.firstResponseAt-geometry.started)*1000+.5)}
+            if #report.catches>8 then table.remove(report.catches,1) end
+        resetCycle("Captura confirmada; relancando")
+        castCheckAt=os.clock() attemptsSinceCheck=0
+    elseif action=="Escaped" then
+        report.escaped=report.escaped+1 resetCycle("Peixe escapou; relancando")
+        castCheckAt=os.clock() attemptsSinceCheck=0
+    end
+end
+local function bindRemote()
+    local folder=RS:FindFirstChild("Remotes")
+    local current=folder and folder:FindFirstChild("Fishing")
+    if current and not current:IsA("RemoteEvent") then current=nil end
+    if current~=fishing then
+        if fishingConnection then fishingConnection:Disconnect() fishingConnection=nil end
+        fishing=current
+    end
+    if fishing and not fishingConnection then fishingConnection=connect(fishing.OnClientEvent,onServer) end
+    return fishing~=nil
+end
+restoreMobile=function()
+    if not mobileDevice then return end
+    restoreGeneration=restoreGeneration+1
+    local generation=restoreGeneration
+    local result={requested=true,status="restoring",nativeTouch=false,errors={}}
+    report.mobileRestore=result
+    local function valid()
+        return not enabled and generation==restoreGeneration and env.__NetoFishingMobileToken==mobileToken
+    end
+    local function forceGui()
+        pcall(function() game:GetService("GuiService").TouchControlsEnabled=true result.touchControlsEnabled=true end)
+        local pg=player:FindFirstChild("PlayerGui") local touch=pg and pg:FindFirstChild("TouchGui")
+        if touch then
+            touch.Enabled=true
+            local frame=touch:FindFirstChild("TouchControlFrame")
+            if frame then
+                frame.Visible=true
+                local jump=frame:FindFirstChild("JumpButton",true)
+                if jump then jump.Visible=true end
+            end
+            result.touchGuiVisible=true
+        end
+    end
+    forceGui()
+    task.spawn(function()
+        if not valid() then return end
+        -- Seleciona novamente os controles de toque do PlayerModule, incluindo o pulo.
+        local ok,err=pcall(function()
+            local ps=player:FindFirstChild("PlayerScripts")
+            local module=ps and ps:FindFirstChild("PlayerModule")
+            if not module then return end
+            local playerModule=require(module)
+            if not valid() then return end
+            local controls=type(playerModule.GetControls)=="function" and playerModule:GetControls()
+            if not controls then return end
+            if type(controls.OnLastInputTypeChanged)=="function" then controls:OnLastInputTypeChanged(Enum.UserInputType.Touch)
+            elseif type(controls.OnPreferredInputChanged)=="function" then controls:OnPreferredInputChanged(Enum.PreferredInput.Touch) end
+            if type(controls.SelectTouchModule)=="function" and type(controls.SwitchToController)=="function" then
+                local selected=controls:SelectTouchModule()
+                if selected then controls:SwitchToController(selected) result.controllerSelected=true end
+            end
+            if type(controls.Enable)=="function" then controls:Enable(true) end
+            if controls.touchJumpController and type(controls.touchJumpController.Enable)=="function" then
+                controls.touchJumpController:Enable(true,controls.touchControlFrame) result.jumpEnabled=true
+            end
+            if controls.touchControlFrame then controls.touchControlFrame.Visible=true end
+        end)
+        if not ok then result.errors[#result.errors+1]=tostring(err):sub(1,140) end
+    end)
+    task.spawn(function()
+        task.wait(.025)
+        if not valid() then return end
+        -- Toque consumido por uma Frame vazia: muda o dispositivo sem clicar no jogo.
+        local vim,sendTouch
+        pcall(function() vim=game:GetService("VirtualInputManager") sendTouch=vim.SendTouchEvent end)
+        if type(sendTouch)=="function" then
+            local pg=player:FindFirstChild("PlayerGui")
+            local shield=Instance.new("ScreenGui") shield.Name="NetoFishingMobileRestore"
+            shield.IgnoreGuiInset=true shield.ResetOnSpawn=false shield.DisplayOrder=2147483000 shield.Parent=overlayParent() or pg
+            ownedGuis[shield]=true
+            local frame=Instance.new("Frame") frame.Name="InputShield" frame.Size=UDim2.new(1,0,1,0)
+            frame.BackgroundTransparency=1 frame.Active=true frame.Parent=shield
+            local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
+            local x,y=math.floor(view.X*.5),math.floor(view.Y*.4)
+            local id=900000+math.floor(os.clock()*1000)%100000
+            local sent,message=pcall(sendTouch,vim,id,0,x,y)
+            if sent then task.wait(.03)
+            elseif #result.errors<3 then result.errors[#result.errors+1]=tostring(message):sub(1,140) end
+            -- Encerra o dedo mesmo com cancelamento ou erro parcial no envio inicial.
+            local ended=pcall(sendTouch,vim,id,2,x,y)
+            result.nativeTouch=sent and ended
+            ownedGuis[shield]=nil shield:Destroy()
+        end
+        for _,delay in ipairs({0,.1,.25}) do
+            if delay>0 then task.wait(delay) end
+            if not valid() then result.status="cancelled" return end
+            forceGui()
+        end
+        pcall(function() result.lastInput=tostring(UIS:GetLastInputType()) end)
+        pcall(function() result.preferredInput=tostring(UIS.PreferredInput) end)
+        result.status="done"
+    end)
+end
+toggle=function(value)
+    if not alive then return end
+    if value==nil then value=not enabled end
+    restoreGeneration=restoreGeneration+1
+    release(true) enabled=value==true resetCycle(enabled and "Chegue perto do lago" or "OFF")
+    if enabled and not bindRemote() then enabled=false phase="Fishing indisponivel." end
+    if enabled then
+        refreshModes() castCheckAt=os.clock() attemptsSinceCheck=0
+        if #modes==0 then enabled=false phase="Executor sem clique virtual. Copie o resultado." restoreMobile()
+        elseif rod() then phase="Clicando rapido para lancar"
+        else phase="Auto ligado; aproxime-se do lago para equipar a vara" end
+    else restoreMobile() end
+    if onChanged then onChanged(enabled,phase) end
+end
+local lastRod=nil
+local function recover(reason)
+    if os.clock()-lastRecovery<3 then return end
+    lastRecovery=os.clock() report.recoveries=report.recoveries+1
+    release(true) resetCycle(reason) castCheckAt=os.clock() attemptsSinceCheck=0
+    nextClick=os.clock()+.1 record("recovery",reason)
+end
+local function finishCatch()
+    local shown,n=progress()
+    if shown and (not n or n<99.95) then return end
+    if not completionSent and geometry.sawBelowFull and (geometry.peak or 0)>=99.95 and os.clock()-stateAt>.2 then
+        completionSent=true report.catchRequests=report.catchRequests+1 record("send","Catch after 100%")
+        fishing:FireServer("Catch")
+    end
+end
+local function step(dt)
+    if not alive or not enabled then return end
+    frameDuration=math.clamp(dt or 1/60,.004,.1)
+    local tool=rod()
+    if not tool then
+        if autoOwned or held then resetCycle("Aguardando vara perto do lago") end
+        lastRod=nil castCheckAt=os.clock() attemptsSinceCheck=0
+        phase="Aguardando vara perto do lago" return
+    end
+    local focused=nil pcall(function() focused=UIS:GetFocusedTextBox() end)
+    if focused then release() phase="Pausado enquanto voce usa o painel" castCheckAt=os.clock() return end
+    if tool~=lastRod then release() lastRod=tool castCheckAt=os.clock() attemptsSinceCheck=0 end
+    if modeFault then if not chooseMode("Falha no clique virtual") then return end end
+    local shown,n=progress()
+    if shown then
+        if pulse then release() end
+        if stage~="reeling" and stage~="waitingCaught" then
+            -- A fisgada e o primeiro segurar nao podem ocupar o mesmo frame.
+            release(true) stage="reeling" stateAt=os.clock()
+            geometry={started=os.clock(),releaseUntil=os.clock()+math.min(frameDuration*.75,.03)} completionSent=false
+            phase="Seguindo o peixe automaticamente"
+        end
+        if stage=="reeling" then
+            if n and n>=99.95 and geometry.sawBelowFull then
+                geometry.peak=n stage="waitingCaught" stateAt=os.clock() phase="100%; aguardando captura"
+                controlBar(dt)
+            else controlBar(dt) end
+        elseif stage=="waitingCaught" then
+            phase="100%; aguardando captura"
+            controlBar(dt)
+            if n and n<99 then stage="reeling" stateAt=os.clock() completionSent=false
+            else finishCatch() end
+        end
+        return -- NENHUM clique de spam enquanto a barra estiver visivel.
+    end
+    if stage=="reeling" then
+        release() stage="waitingCaught" stateAt=os.clock()
+    end
+    if stage=="waitingCaught" then
+        finishCatch()
+        if os.clock()-stateAt>4 then recover("Sem confirmacao; soltando e relancando") end
+    end
+    if stage=="idle" then
+        cycle=cycle+1 autoOwned=true stage="casting" stateAt=os.clock() castAt=os.clock()
+        geometry={} completionSent=false phase="Clicando rapido para lancar"
+    end
+    -- Soltar ocupa seu proprio frame. Nenhum novo press vem nesta mesma passagem.
+    if pulse then
+        if pulse.epoch~=inputEpoch or os.clock()>=pulse.releaseAt then release() end
+        return
+    end
+    if stage=="casting" and os.clock()-castCheckAt>8 and attemptsSinceCheck>10 then
+        recover("Lançamento demorou; soltando e tentando novamente")
+    elseif stage=="waitingBite" then
+        phase="Vara lancada; aguardando !"
+        if os.clock()-stateAt>15 then recover("Sem mordida; soltando e tentando relancar") end
+    elseif stage=="hooking" and os.clock()-stateAt>4 then
+        recover("Sem barra; soltando e tentando relancar")
+    end
+    -- Para ao confirmar o lancamento. A proxima entrada e somente na mordida.
+    if stage=="casting" and os.clock()>=nextClick then click()
+    elseif stage=="hooking" and hookAttempts<4 and os.clock()>=nextClick then click("Hook no !") end
+end
+connect(Run.RenderStepped,function(dt)
+    if not enabled then return end
+    local ok,err=pcall(step,dt)
+    if not ok then report.error=tostring(err) toggle(false) phase="Erro. Copie o resultado." end
+    if not enabled and onChanged then onChanged(false,phase) end
+end)
+
+close=function()
+    if not alive then return end
+    toggle(false) alive=false
+    for _,c in ipairs(links) do c:Disconnect() end
+end
+return {
+    Toggle=toggle,Close=close,RestoreMobile=restoreMobile,Report=report,
+    IsEnabled=function() return enabled end,
+    SetInterval=function(seconds)
+        interval=math.clamp(tonumber(seconds) or .001,.001,3)
+        report.interval=interval
+    end,
+    Validate=function() return bindRemote(),"Fishing nao encontrado." end,
+}
+end
+local FishingController=nil
+local function getFishingController()
+    if not FishingController then
+        -- Encerra a versao avulsa para nao haver dois controladores de entrada.
+        for _,name in ipairs({"FishingDebug","FishingAutoTest"}) do
+            if env[name] and type(env[name].Close)=="function" then pcall(env[name].Close) end
+        end
+        FishingController=createFishingController(function(on,reason)
+            if autoFish.toggle and autoFish.toggle.Value~=on then autoFish.toggle:SetValue(on) end
+            if not on and reason and reason~="OFF" then notify("Auto Fish: "..reason) end
+        end)
+    end
+    return FishingController
+end
+autoFish.validate=function()
+    if not remote("Fishing") then return false,"Fishing nao encontrado." end
+    return getFishingController().Validate()
+end
+autoFish.start=function()
+    local controller=getFishingController()
+    controller.SetInterval(autoFish.interval) controller.Toggle(true)
+end
+autoFish.release=function() if FishingController then FishingController.Toggle(false) end end
+autoFish.updateInterval=function(seconds) if FishingController then FishingController.SetInterval(seconds) end end
+
+-- Anti-AFK orientado ao evento de inatividade, independente da pesca.
+local AntiAFK=(function()
+    local idleConnection,virtualUser=nil,nil
+    local rightHeld,busy=false,false
+    local pulseGeneration=0
+    local lastPulse=-math.huge
+    local heldCamera=nil
+    local function releaseRight()
+        local wasHeld=rightHeld
+        rightHeld=false busy=false
+        if wasHeld and virtualUser then pcall(function() virtualUser:Button2Up(Vector2.new(0,0),heldCamera) end) end
+        heldCamera=nil
+        if wasHeld and (not FishingController or not FishingController.IsEnabled()) then
+            pcall(function() getFishingController().RestoreMobile() end)
+        end
+    end
+    local function stop()
+        pulseGeneration=pulseGeneration+1
+        if idleConnection then idleConnection:Disconnect() idleConnection=nil end
+        releaseRight()
+    end
+    antiAFK.validate=function()
+        virtualUser=game:GetService("VirtualUser")
+        return player.Idled~=nil and virtualUser~=nil,"Anti-AFK indisponivel neste executor."
+    end
+    antiAFK.start=function()
+        stop()
+        local generation=pulseGeneration
+        idleConnection=player.Idled:Connect(function()
+            if not alive or not antiAFK.enabled or generation~=pulseGeneration or busy or os.clock()-lastPulse<5 then return end
+            local camera=workspace.CurrentCamera
+            if not camera then return end
+            busy=true lastPulse=os.clock() heldCamera=camera.CFrame
+            local ok,err=pcall(function()
+                virtualUser:CaptureController()
+                rightHeld=true virtualUser:Button2Down(Vector2.new(0,0),heldCamera)
+            end)
+            if not ok then
+                releaseRight() antiAFK.error=tostring(err)
+                antiAFK.toggle:SetValue(false) notify("Anti-AFK: "..tostring(err)) return
+            end
+            task.delay(.05,function() if generation==pulseGeneration then releaseRight() end end)
+        end)
+    end
+    antiAFK.release=stop
+    return {Close=stop}
+end)()
+
 local function intervalControls(box,f)
     box:AddInput(f.id.."Interval",{
         Text="Intervalo",Default=string.format("%.9g",f.interval),Numeric=false,
@@ -1023,6 +1632,7 @@ local tabs={
     CombatTree=Window:AddTab("Combate / Tree","swords"),
     Purchases=Window:AddTab("Coins / Compras","shopping-cart"),
     Spam=Window:AddTab("Spam Button","scan"),
+    Fishing=Window:AddTab("Pesca / Utilidades","fish"),
 }
 local layout={
     {f=cash,tab=tabs.Droppers,side="Left"},
@@ -1033,14 +1643,16 @@ local layout={
     {f=floorUpgrades,tab=tabs.Purchases,side="Left"},
     {f=potions,tab=tabs.Purchases,side="Right"},
     {f=spam,tab=tabs.Spam,side="Left"},
+    {f=autoFish,tab=tabs.Fishing,side="Left"},
+    {f=antiAFK,tab=tabs.Fishing,side="Right"},
 }
 local panelListBox,rows={},{}
 for _,item in ipairs(layout) do
     local f=item.f
     local control=item.tab:AddGroupbox({Side=item.side,Name=f.title})
-    control:AddToggle(f.id.."Enabled",{Text=f.title,Default=false})
+    control:AddToggle(f.id.."Enabled",{Text=f.title,Default=f.default==true})
     f.toggle=Toggles[f.id.."Enabled"]
-    if f~=floorUpgrades and f~=potions then intervalControls(control,f) end
+    if f~=floorUpgrades and f~=potions and f~=antiAFK then intervalControls(control,f) end
     if f==coins then
         control:AddSlider("CoinsBatch",{Text="Moedas por lote",Default=25,Min=1,Max=50,Rounding=0})
         control:AddInput("CoinsRetry",{Text="Repetir pedido pendente (s)",Default="3",Numeric=false,Finished=false,ClearTextOnFocus=false})
@@ -1145,7 +1757,7 @@ for _,f in ipairs(ordered) do
         local n=tonumber((tostring(Options[f.id.."Interval"].Value):gsub(",",".")))
         local seconds=n and (f.unit=="ms" and n/1000 or n)
         f.validInterval=seconds~=nil and seconds==seconds and seconds>=0 and seconds<=86400
-        if f.validInterval then f.interval=seconds end
+        if f.validInterval then f.interval=seconds if f.updateInterval then f.updateInterval(seconds) end end
     end)
     Options[f.id.."Unit"]:OnChanged(function()
         local unit=Options[f.id.."Unit"].Value
@@ -1155,10 +1767,11 @@ for _,f in ipairs(ordered) do
         local n=tonumber((tostring(Options[f.id.."Interval"].Value):gsub(",",".")))
         local seconds=n and (unit=="ms" and n/1000 or n)
         f.validInterval=seconds~=nil and seconds==seconds and seconds>=0 and seconds<=86400
-        if f.validInterval then f.interval=seconds end
+        if f.validInterval then f.interval=seconds if f.updateInterval then f.updateInterval(seconds) end end
     end)
     end
 end
+if antiAFK.toggle.Value then setFeature(antiAFK,true) end
 Options.CoinsBatch:OnChanged(function() coins.batch=math.clamp(math.floor(Options.CoinsBatch.Value),1,50) end)
 Options.CoinsRetry:OnChanged(function()
     local n=tonumber((tostring(Options.CoinsRetry.Value):gsub(",",".")))
@@ -1280,7 +1893,7 @@ if SaveManager and filesystem then
     local ok,err=pcall(function()
         SaveManager:SetLibrary(Library)
         SaveManager:IgnoreThemeSettings()
-        SaveManager:SetIgnoreIndexes({"CashEnabled","BronzeEnabled","CoinsEnabled","CombatEnabled","TreeEnabled","SpamEnabled","PotionsEnabled","FloorEnabled","MenuKeybind"})
+        SaveManager:SetIgnoreIndexes({"CashEnabled","BronzeEnabled","CoinsEnabled","CombatEnabled","TreeEnabled","SpamEnabled","PotionsEnabled","FloorEnabled","FishingEnabled","AntiAFKEnabled","MenuKeybind"})
         SaveManager:SetFolder("NetoHub/"..tostring(game.PlaceId))
         SaveManager:BuildConfigSection(settingsTab)
         SaveManager:LoadAutoloadConfig()
@@ -1296,6 +1909,8 @@ local function cleanup()
     if not alive then return end
     stopAll()
     Purchases.Close()
+    AntiAFK.Close()
+    if FishingController then FishingController.Close() end
     alive=false
     for _,c in ipairs(connections) do c:Disconnect() end
     spam.release()
@@ -1308,7 +1923,11 @@ env.NetoHubCleanup=function()
     if not Library.Unloaded then Library:Unload() else cleanup() end
 end
 env.NetoHub={Features=features,Library=Library,Window=Window,StopAll=stopAll,
-    PanelEntries=panelEntries,RemovePanel=removePanelEntry,StartScan=env.NetoHubStartScan}
+    PanelEntries=panelEntries,RemovePanel=removePanelEntry,StartScan=env.NetoHubStartScan,
+    GetFishingController=getFishingController}
+for _,name in ipairs({"FishingDebug","FishingAutoTest"}) do
+    if env[name] and type(env[name].Close)=="function" then pcall(env[name].Close) end
+end
 -- Encerra as versoes antigas para evitar loops duplicados.
 env.CombatAutoRunning=false
 for _,name in ipairs({"AutoInteractCleanup","BronzeDropperCleanup","AutoMoedasCleanup","CombatAutoCleanup",
