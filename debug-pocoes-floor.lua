@@ -24,6 +24,9 @@ local castAt,biteAt,hookAt=nil,nil,nil
 local interval=0.001
 local lastClick,nextClick=-math.huge,0
 local castCheckAt,attemptsSinceCheck=0,0
+local pulse=nil
+local frameDuration=1/60
+local lastRecovery=-math.huge
 local completionSent,held=false,false
 local inputEpoch,injecting=0,0
 local activeInput=nil
@@ -31,7 +34,7 @@ local virtualInputAt=-math.huge
 local virtualX,virtualY=nil,nil
 local modes,modeIndex={},1
 local modeFault,inputWorking=false,false
-local autoOwned,manualAssisted=false,false
+local autoOwned=false
 local geometry={}
 local dropDebug=nil
 local dropConnection=nil
@@ -39,9 +42,9 @@ local dragging=false
 local autoButton=nil
 local toggle,close,copy,setHeld,click,chooseMode
 local startDropDebug,stopDropDebug
-local report={format="fishing-controller-v7-fast-screen",placeId=game.PlaceId,
-    note="Cliques virtuais rapidos sem minigame; durante a barra usa segurar/soltar. Caught recebido confirma captura. Frequencia limitada aos frames. Queda/mordida nao removidas.",
-    caught=0,escaped=0,manualOrUnownedCaught=0,manualTouches=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,
+local report={format="fishing-controller-v8-stable-screen",placeId=game.PlaceId,
+    note="Conta Caught recebido enquanto ligado; nao distingue ajuda manual. Cliques completos em frames separados sem minigame; durante a barra segue o peixe. Nao remove queda/mordida.",
+    caught=0,escaped=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,recoveries=0,holdResyncs=0,
     events={},catches={},inputErrors={},capabilities={},interval=interval}
 local function connect(signal,fn)
     local c=signal:Connect(fn) links[#links+1]=c return c
@@ -181,13 +184,20 @@ setHeld=function(down,force)
     if not down then activeInput=nil end
     return true
 end
-local function release()
+local function release(force)
     inputEpoch=inputEpoch+1
-    if held then setHeld(false,true) end
+    pulse=nil
+    if force and not activeInput then
+        local x,y=virtualX,virtualY
+        if not x then x,y=position() end
+        if x then activeInput={x=x,y=y} end
+    end
+    if held or (force and activeInput) then setHeld(false,true) end
     held=false activeInput=nil
 end
 chooseMode=function(reason)
-    release() record("input","Switch",reason)
+    -- Troca somente depois de erro real da API, nunca por demora do servidor ou borda da barra.
+    release(true) record("input","Switch",reason)
     modeIndex=modeIndex+1
     if modeIndex>#modes then
         enabled=false phase="Clique virtual indisponivel. Copie o resultado."
@@ -204,14 +214,15 @@ click=function(reason)
     if shown then return false end -- Nunca mistura spam com o controle da barra.
     local x=position()
     if not x then release() phase="Ponto de clique coberto pela interface" return false end
-    release()
+    if pulse or held then return false end
     lastClick=os.clock() nextClick=lastClick+interval
+    local epoch=inputEpoch
     if not setHeld(true) then return false end
     report.clicks=report.clicks+1 attemptsSinceCheck=attemptsSinceCheck+1
     if reason then record("input",reason) end
-    local epoch=inputEpoch
-    -- Pulso curto, sem espera bloqueante. O proximo frame pode emitir outro clique.
-    task.delay(.001,function() if alive and epoch==inputEpoch then release() end end)
+    -- Um frame pressionado e outro solto. Evita que o mobile junte os dois estados.
+    -- A soltura e processada no RenderStepped, sem tasks atrasadas de cliques antigos.
+    if enabled and epoch==inputEpoch then pulse={releaseAt=os.clock()+.008,epoch=epoch} end
     return true
 end
 -- Painel de teste independente: ligado/desligado, intervalo e resultado para retorno.
@@ -294,8 +305,8 @@ end
 local function resetCycle(reason)
     release()
     cycle=cycle+1 stage="idle" stateAt=os.clock() castAt=nil biteAt=nil hookAt=nil
-    autoOwned=false manualAssisted=false completionSent=false geometry={}
-    nextClick=0 phase=reason or "Aguardando"
+    autoOwned=false completionSent=false geometry={}
+    nextClick=os.clock()+math.min(frameDuration,.04) phase=reason or "Aguardando"
 end
 local function controlBar(dt)
     local bar=reelBar()
@@ -323,6 +334,7 @@ local function controlBar(dt)
     local dead=math.clamp(zw*.045,.003,.014)
     local desired=held
     if error>dead then desired=true elseif error< -dead then desired=false end
+    if g.resyncUntil and os.clock()<g.resyncUntil then desired=false end
     if not setHeld(desired) then
         if pointBlocked then phase="Ponto de clique coberto pela interface" g.lastMove=os.clock()
         elseif chooseMode("Segurar/soltar recusado") then setHeld(desired,true) end
@@ -335,9 +347,11 @@ local function controlBar(dt)
     g.error=error g.inside=math.abs(fx-zx)<=zw*.5
     local _,percent=progress()
     if percent then g.peak=math.max(g.peak or 0,percent) if percent<99 then g.sawBelowFull=true end end
-    if not g.inside and os.clock()-g.lastMove>.65 then
-        chooseMode("Barra nao respondeu ao segurar/soltar")
-        g.lastMove=os.clock()
+    local atLimit=(desired and zx>=1-zw*.5-.04) or (not desired and zx<=zw*.5+.04)
+    if not g.inside and not atLimit and os.clock()-g.lastMove>1.2 and os.clock()-(g.lastResync or -math.huge)>1.5 then
+        -- Ressincroniza soltar/segurar; nao abandona o metodo que ja pescou.
+        release(true) g.lastResync=os.clock() g.resyncUntil=os.clock()+math.min(frameDuration,.04)
+        g.lastMove=os.clock() report.holdResyncs=report.holdResyncs+1
     end
     report.controller={t=now(),fish=fx,zone=zx,width=zw,held=held,inside=g.inside,peak=g.peak,inputWorking=inputWorking}
 end
@@ -347,7 +361,7 @@ local function onServer(action,...)
     if not enabled then return end
     local args=table.pack(...)
     if action=="Cast" then
-        if os.clock()-lastClick<2 and autoOwned then
+        if autoOwned then
             stage="waitingBite" stateAt=os.clock()
             castAt=castAt or os.clock() inputWorking=true castCheckAt=os.clock()
             report.castsAccepted=report.castsAccepted+1
@@ -357,16 +371,17 @@ local function onServer(action,...)
         report.bites=report.bites+1 biteAt=os.clock()
         if autoOwned then
             stage="hooking" stateAt=os.clock() phase="Fisgando"
-            hookAt=os.clock() click("Hook no !")
+            hookAt=os.clock() release(true) nextClick=os.clock()+math.min(frameDuration,.04)
+            record("input","Hook agendado no !")
         end
     elseif action=="Caught" then
-        if autoOwned and not manualAssisted and geometry.sawBelowFull then
-            report.caught=report.caught+1
+        -- Touch sintetico no mobile nao identifica autoria. Conta apenas o evento real,
+        -- sem classificar centenas de eventos injetados como intervencao manual.
+        report.caught=report.caught+1
             report.catches[#report.catches+1]={t=now(),fish=safe(args[1],0,{left=8}),value2=safe(args[2],0,{left=8}),
                 value3=safe(args[3],0,{left=8}),autoFlag=args[4],seconds=castAt and os.clock()-castAt,
                 localPeak=geometry.peak,mode=modes[modeIndex] and modes[modeIndex].name}
             if #report.catches>8 then table.remove(report.catches,1) end
-        else report.manualOrUnownedCaught=report.manualOrUnownedCaught+1 end
         resetCycle("Captura confirmada; relancando")
         castCheckAt=os.clock() attemptsSinceCheck=0
     elseif action=="Escaped" then
@@ -375,19 +390,10 @@ local function onServer(action,...)
     end
 end
 connect(fishing.OnClientEvent,onServer)
-connect(UIS.InputBegan,function(input,processed)
-    if injecting>0 or not enabled or processed or not autoOwned then return end
-    if input.UserInputType~=Enum.UserInputType.Touch and input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
-    if input.UserInputType==Enum.UserInputType.MouseButton1 and os.clock()-virtualInputAt<.12 then
-        local p=input.Position
-        if not p or not virtualX or (math.abs(p.X-virtualX)<=8 and math.abs(p.Y-virtualY)<=8) then return end
-    end
-    manualAssisted=true report.manualTouches=report.manualTouches+1
-end)
 toggle=function(value)
     if not alive then return end
     if value==nil then value=not enabled end
-    release() enabled=value==true resetCycle(enabled and "Chegue perto do lago" or "OFF")
+    release(true) enabled=value==true resetCycle(enabled and "Chegue perto do lago" or "OFF")
     if enabled then
         refreshModes() castCheckAt=os.clock() attemptsSinceCheck=0
         if #modes==0 then enabled=false phase="Executor sem clique virtual. Copie o resultado."
@@ -439,6 +445,12 @@ connect(intervalBox.FocusLost,function()
     intervalBox.Text=tostring(interval) report.interval=interval
 end)
 local lastRod=nil
+local function recover(reason)
+    if os.clock()-lastRecovery<3 then return end
+    lastRecovery=os.clock() report.recoveries=report.recoveries+1
+    release(true) resetCycle(reason) castCheckAt=os.clock() attemptsSinceCheck=0
+    nextClick=os.clock()+.1 record("recovery",reason)
+end
 local function finishCatch()
     local shown,n=progress()
     if shown and (not n or n<99.95) then return end
@@ -449,6 +461,7 @@ local function finishCatch()
 end
 local function step(dt)
     if not alive or not enabled then return end
+    frameDuration=math.clamp(dt or 1/60,.004,.1)
     local tool=rod()
     if not tool then
         if autoOwned or held then resetCycle("Aguardando vara perto do lago") end
@@ -461,6 +474,7 @@ local function step(dt)
     if modeFault then if not chooseMode("Falha no clique virtual") then return end end
     local shown,n=progress()
     if shown then
+        if pulse then release() end
         if stage~="reeling" and stage~="waitingCaught" then
             -- Cancela a soltura atrasada de um clique antes de segurar a barra.
             release() stage="reeling" stateAt=os.clock() geometry={} completionSent=false
@@ -484,22 +498,27 @@ local function step(dt)
     end
     if stage=="waitingCaught" then
         finishCatch()
-        if os.clock()-stateAt>3 then resetCycle("Sem confirmacao; relancando") end
+        if os.clock()-stateAt>4 then recover("Sem confirmacao; soltando e relancando") end
     end
     if stage=="idle" then
-        cycle=cycle+1 autoOwned=true manualAssisted=false stage="casting" stateAt=os.clock() castAt=os.clock()
+        cycle=cycle+1 autoOwned=true stage="casting" stateAt=os.clock() castAt=os.clock()
         geometry={} completionSent=false phase="Clicando rapido para lancar"
     end
-    -- Fora da barra, continua clicando inclusive durante queda, espera do ! e relancamento.
-    if os.clock()>=nextClick then click() end
-    if stage=="casting" and os.clock()-castCheckAt>4 and attemptsSinceCheck>10 then
-        chooseMode("Nenhum lancamento confirmado pelo servidor")
+    -- Soltar ocupa seu proprio frame. Nenhum novo press vem nesta mesma passagem.
+    if pulse then
+        if pulse.epoch~=inputEpoch or os.clock()>=pulse.releaseAt then release() end
+        return
+    end
+    if stage=="casting" and os.clock()-castCheckAt>8 and attemptsSinceCheck>10 then
+        recover("Lançamento demorou; soltando e tentando novamente")
     elseif stage=="waitingBite" then
         phase="Clicando rapido; aguardando !"
-        if os.clock()-stateAt>12 then resetCycle("Sem mordida; tentando relancar") end
-    elseif stage=="hooking" and os.clock()-stateAt>3 then
-        resetCycle("Sem barra; tentando relancar")
+        if os.clock()-stateAt>15 then recover("Sem mordida; soltando e tentando relancar") end
+    elseif stage=="hooking" and os.clock()-stateAt>4 then
+        recover("Sem barra; soltando e tentando relancar")
     end
+    -- Fora da barra, continua clicando durante queda, espera do ! e relancamento.
+    if os.clock()>=nextClick then click() end
 end
 connect(Run.RenderStepped,function(dt)
     if not enabled then return end
