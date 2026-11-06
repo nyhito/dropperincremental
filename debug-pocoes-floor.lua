@@ -1,5 +1,5 @@
--- Dig / gamepass: detector de protocolo, faixa verde e proximo ponto.
--- Nenhum clique/TP automatico. O teste visual e opcional e reversivel.
+-- Dig / gamepass: teste automatico pelo protocolo observado e faixa real.
+-- Auto e TP iniciam desligados. Nenhum horario/acerto e forjado.
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
 local Run=game:GetService("RunService")
@@ -18,13 +18,15 @@ local function current(token) return alive and running and generation==token end
 local started=0
 local links,sessionLinks={},{}
 local own=setmetatable({}, {__mode="k"})
-local report={format="dig-debug-v1",placeId=game.PlaceId}
+local report={format="dig-debug-v2-auto",placeId=game.PlaceId}
 local refs={objects={}}
 local bound=setmetatable({}, {__mode="k"})
 local pendingButtons={}
 local monitored,remoteInfo={},{}
 local visual=nil
 local start,stop,copy,close,testZone
+local toggleAuto,toggleTP,autoStep,onTreasure
+local auto={enabled=false,tp=false,phase="OFF"}
 local function at() return math.floor((os.clock()-started)*1000+.5)/1000 end
 local function listen(signal,fn,list)
     own[fn]=true local c=signal:Connect(fn) local into=list or sessionLinks into[#into+1]=c return c
@@ -38,7 +40,7 @@ end
 local function stateWord(s)
     s=tostring(s):lower()
     if word(s) then return true end
-    for _,v in ipairs({"target","spot","green","zone","cursor","window","signal","layer","sweep","width","search"}) do if s:find(v,1,true) then return true end end
+    for _,v in ipairs({"target","spot","green","zone","cursor","window","signal","layer","sweep","width","search","strike","hit"}) do if s:find(v,1,true) then return true end end
     return false
 end
 local function path(obj) local ok,s=pcall(function() return obj:GetFullName() end) return ok and s or "[removed]" end
@@ -75,7 +77,7 @@ local function shown(obj)
     return false
 end
 local gui=Instance.new("ScreenGui") gui.Name="NetoDigDebug" gui.ResetOnSpawn=false gui.DisplayOrder=10032 gui.Parent=pg
-local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(330,265) panel.Position=UDim2.new(0,12,.16,0)
+local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(330,335) panel.Position=UDim2.new(0,12,.08,0)
 panel.BackgroundColor3=Color3.fromRGB(21,23,30) panel.Parent=gui
 Instance.new("UICorner",panel).CornerRadius=UDim.new(0,9)
 local function button(text,x,y,w,h)
@@ -90,20 +92,25 @@ local minimize=button("-",260,6,25,25) local exit=button("X",292,6,25,25)
 local startButton=button("Iniciar debug (30 s)",10,42,310,34)
 local stopButton=button("Parar / copiar",10,84,150,32) local copyButton=button("Copiar resultado",170,84,150,32)
 local testButton=button("Testar faixa verde: OFF",10,125,310,34)
+local autoButton=button("Auto Dig: OFF",10,167,150,34)
+local tpButton=button("TP ao ponto: OFF",170,167,150,34)
 local label=Instance.new("TextLabel") label.Text="Ligue a gamepass e inicie antes de achar um ponto."
 label.TextWrapped=true label.TextXAlignment=Enum.TextXAlignment.Left label.TextYAlignment=Enum.TextYAlignment.Top
 label.Font=Enum.Font.Gotham label.TextSize=12 label.TextColor3=Color3.new(1,1,1) label.BackgroundTransparency=1
-label.Position=UDim2.fromOffset(10,171) label.Size=UDim2.fromOffset(310,82) label.Parent=panel
+label.Position=UDim2.fromOffset(10,213) label.Size=UDim2.fromOffset(310,110) label.Parent=panel
 local mini=Instance.new("TextButton") mini.Text="DIG" mini.Font=Enum.Font.GothamBold mini.TextSize=12 mini.TextColor3=Color3.new(1,1,1)
 mini.BackgroundColor3=Color3.fromRGB(66,49,110) mini.Position=panel.Position mini.Size=UDim2.fromOffset(60,36) mini.Visible=false mini.Parent=gui
 local output=Instance.new("TextBox") output.Text="" output.MultiLine=true output.TextWrapped=true output.ClearTextOnFocus=false
 output.Font=Enum.Font.Code output.TextSize=10 output.TextColor3=Color3.new(1,1,1) output.BackgroundColor3=Color3.fromRGB(29,31,39)
 output.TextXAlignment=Enum.TextXAlignment.Left output.TextYAlignment=Enum.TextYAlignment.Top
-output.Position=UDim2.fromOffset(0,272) output.Size=UDim2.fromOffset(330,135) output.Visible=false output.Parent=panel
+output.Position=UDim2.fromOffset(0,342) output.Size=UDim2.fromOffset(330,135) output.Visible=false output.Parent=panel
 
 -- Captura pequena. Nunca chama metodos de Instance/JSON dentro do namecall.
 local probe=env.__NetoDigProbe
-if type(probe)~="table" then probe={installed=false,enabled=false} env.__NetoDigProbe=probe end
+if type(probe)~="table" or probe.version~=2 then
+    if type(probe)=="table" then probe.enabled=false end
+    probe={version=2,installed=false,enabled=false} env.__NetoDigProbe=probe
+end
 local function rawClone(v,depth,budget)
     budget.left=budget.left-1 if budget.left<0 then return "[limit]" end
     if type(v)~="table" then return v end
@@ -115,7 +122,7 @@ end
 local function enqueue(kind,obj,method,...)
     if not running then return end
     if probe.tail-probe.head>=160 then report.dropped=report.dropped+1 return end
-    local values=table.pack(...) local copied={n=math.min(values.n,6)} local budget={left=24}
+    local values=table.pack(...) local copied={n=math.min(values.n,12),totalN=values.n} local budget={left=48}
     for i=1,copied.n do copied[i]=rawClone(values[i],0,budget) end
     probe.tail=probe.tail+1 probe.queue[probe.tail]={kind=kind,obj=obj,method=method,args=copied,time=os.clock()}
 end
@@ -130,7 +137,7 @@ local function installProbe()
             if method=="FireServer" or method=="InvokeServer" then
                 probe.seen[self]=true
                 if probe.tail-probe.head<160 then
-                    local args=table.pack(...) local values={n=math.min(args.n,6)} local budget={left=24}
+                    local args=table.pack(...) local values={n=math.min(args.n,12),totalN=args.n} local budget={left=48}
                     for i=1,values.n do values[i]=rawClone(args[i],0,budget) end
                     probe.tail=probe.tail+1 probe.queue[probe.tail]={kind="send",obj=self,method=method,args=values,time=os.clock()}
                 else probe.dropped=probe.dropped+1 end
@@ -160,7 +167,7 @@ end
 local function isText(obj) return obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") end
 local function clean(s) return tostring(s):gsub("<[^>]+>",""):lower():gsub("%s+", " "):match("^%s*(.-)%s*$") end
 local function caption(obj)
-    if obj:IsA("TextButton") then return clean(obj.Text) end
+    if obj:IsA("TextButton") then local text=clean(obj.Text) if text~="" then return text end end
     for i,x in ipairs(obj:GetDescendants()) do
         if i>16 then break end
         if isText(x) then local text=clean(x.Text) if text=="dig" or text=="find the spot" then return text end end
@@ -200,9 +207,16 @@ local function findGeometry()
         if zone:IsA("Frame") or zone:IsA("ImageLabel") or zone:IsA("CanvasGroup") then
             local c=zone.BackgroundColor3 local parent=zone.Parent local size=zone.AbsoluteSize
             if zone:IsA("ImageLabel") then local tint=zone.ImageColor3 if tint and tint.G>.4 and tint.G>tint.R*1.15 and tint.G>tint.B*1.1 then c=tint end end
+            local name=zone.Name:lower()
+            local green=(c.G>.4 and c.G>c.R*1.15 and c.G>c.B*1.1) or name:find("green",1,true) or name=="zone" or name=="targetzone" or name=="sweetspot"
+            if not green then
+                for _,child in ipairs(zone:GetChildren()) do
+                    if child:IsA("UIGradient") then for _,key in ipairs(child.Color.Keypoints) do local color=key.Value if color.G>.4 and color.G>color.R*1.15 and color.G>color.B*1.1 then green=true break end end end
+                end
+            end
             if parent and parent:IsA("GuiObject") and parent.AbsoluteSize.X>60 and size.X>15 and size.Y>5
                 and size.X<parent.AbsoluteSize.X*.9 and size.Y<parent.AbsoluteSize.Y*1.6
-                and c.G>.4 and c.G>c.R*1.15 and c.G>c.B*1.1 then
+                and green then
                 local marker,score=nil,0
                 for i,obj in ipairs(parent:GetDescendants()) do
                     if i>45 then break end
@@ -265,6 +279,10 @@ local function discoverUi(token)
     local function scan(root)
         for i,obj in ipairs(root:GetDescendants()) do
             if not current(token) then return end
+            local name=obj.Name:lower()
+            if not refs.hud and (obj:IsA("GuiObject") or obj:IsA("ScreenGui")) and (name=="treasurehunting" or name=="treasurehuntinghud" or name=="detectorhud" or name=="treasurebar") then
+                refs.hud=obj report.hud=path(obj) refreshObjects()
+            end
             if obj:IsA("GuiButton") and not obj:IsDescendantOf(gui) then
                 if #pendingButtons<320 then pendingButtons[#pendingButtons+1]=obj end
                 bindButton(obj)
@@ -343,7 +361,7 @@ local function drain()
                 local found=false
                 for _,variant in ipairs(group.variants) do if variant.signature==encoded then variant.count=variant.count+1 variant.last=row.time-started found=true break end end
                 if not found then
-                    if #group.variants<3 then group.variants[#group.variants+1]={signature=encoded,args=args,argCount=row.args.n,count=1,first=row.time-started,last=row.time-started}
+                    if #group.variants<3 then group.variants[#group.variants+1]={signature=encoded,args=args,argCount=row.args.totalN or row.args.n,count=1,first=row.time-started,last=row.time-started}
                     else group.otherVariants=(group.otherVariants or 0)+1 group.lastArgs=args end
                 end
             end
@@ -351,7 +369,7 @@ local function drain()
     end
     if probe.head>probe.tail then probe.head=1 probe.tail=0 probe.queue={} end
 end
-local noisy={DropperClick=true,BronzeDropperClick=true,CollectPart=true,MobAttackMlt=true,TreeHit=true,AutoTreeHit=true,EnemySwing=true,EnemyDamaged=true,RockDestroyed=true,Smelter=true,RockDamaged=true,Upgrade=true,Merchant=true}
+local noisy={DropperClick=true,BronzeDropperClick=true,CollectPart=true,MobAttackMlt=true,TreeHit=true,AutoTreeHit=true,EnemySwing=true,EnemyDamaged=true,EnemyKilled=true,CrystalDestroyed=true,UpdateGlobalMilestones=true,RockDestroyed=true,Smelter=true,RockDamaged=true,Upgrade=true,Merchant=true}
 local function attachRemote(obj)
     if remoteInfo[obj] or (not obj:IsA("RemoteEvent") and not obj:IsA("RemoteFunction")) then return end
     local info={path=path(obj),class=obj.ClassName,related=word(obj.Name)} remoteInfo[obj]=info
@@ -360,8 +378,9 @@ local function attachRemote(obj)
     if #report.remoteInventory<35 then report.remoteInventory[#report.remoteInventory+1]=info end
     if obj:IsA("RemoteEvent") then listen(obj.OnClientEvent,function(...)
         if not running then return end
+        if obj.Name=="TreasureHunting" and onTreasure then onTreasure(...) end
         local action=select(1,...)
-        if info.related or probe.seen[obj] or os.clock()-lastTap<.4 or at()<1.2 or (type(action)=="string" and stateWord(action)) then enqueue("receive",obj,"OnClientEvent",...) end
+        if info.related or probe.seen[obj] or os.clock()-lastTap<.4 or (type(action)=="string" and stateWord(action)) then enqueue("receive",obj,"OnClientEvent",...) end
     end) end
 end
 
@@ -427,6 +446,7 @@ local function inspectLogic(token)
             local entry=queue[head] head=head+1
             local src,name=source(entry.fn) if src=="" then src=entry.owner or "" end
             local row={source=src,name=name,origin=entry.origin,kind=entry.live and "active-reference" or "metadata-only",constants={},upvalues={},score=0}
+            if src:find("TreasureHunting",1,true) then row.score=row.score+100 end
             if type(constants)=="function" then
                 local ok,values=pcall(constants,entry.fn)
                 if ok and type(values)=="table" then
@@ -439,7 +459,7 @@ local function inspectLogic(token)
                 end
             end
             if entry.live and type(upvalues)=="function" then
-                if #monitored<4 then monitored[#monitored+1]={fn=entry.fn,source=src,name=name} end
+                if #monitored<4 and (src:find("TreasureHunting",1,true) or src:find("Detector",1,true)) then monitored[#monitored+1]={fn=entry.fn,source=src,name=name} end
                 local ok,values=pcall(upvalues,entry.fn)
                 if ok and type(values)=="table" then
                     local n=0
@@ -488,6 +508,168 @@ local function inspectLogic(token)
         process()
     end
     if current(token) then report.logic.status=#monitored>0 and "active_references_found" or (#report.logic.functions>0 and "metadata_only" or "no_accessible_dig_function") end
+end
+
+-- Protocolo visto no debug: Dig(); Strike(layerToken, horario atual).
+-- Layer: token, inicio, indice, centro e largura. Campos adicionais sao preservados.
+local function treasureRemote()
+    local remotes=RS:FindFirstChild("Remotes")
+    local remote=remotes and remotes:FindFirstChild("TreasureHunting")
+    return remote and remote:IsA("RemoteEvent") and remote or nil
+end
+local function autoLog(kind,action,extra)
+    if report.auto then add(report.auto.events,{t=at(),kind=kind,action=action,data=extra},14) end
+end
+local function send(action,...)
+    local remote=treasureRemote()
+    if not remote then auto.phase="Remote TreasureHunting ausente" return false end
+    local args=table.pack(...)
+    local ok,err=pcall(function() remote:FireServer(action,table.unpack(args,1,args.n)) end)
+    if not ok then auto.phase="Falha ao enviar "..action autoLog("error",action,tostring(err):sub(1,150)) end
+    return ok
+end
+local function serverNow()
+    local ok,value=pcall(function() return workspace:GetServerTimeNow() end)
+    if ok and type(value)=="number" then return value end
+    -- A camada fornece uma referencia no mesmo relogio; nao usa o relogio do celular.
+    if auto.layer then return auto.layer.started+os.clock()-auto.layer.receivedAt end
+end
+local function sync()
+    if os.clock()-(auto.lastSync or -math.huge)<1 then return end
+    auto.lastSync=os.clock() send("Sync")
+end
+local function jumpToSpot()
+    if not auto.enabled or not auto.tp or not auto.spot or auto.jumpedKey==auto.spot.key then return end
+    local character=player.Character local root=character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    local target=auto.spot.position
+    if (root.Position-target).Magnitude>500 then auto.phase="Ponto fora da area de teste" return end
+    local ok,err=pcall(function()
+        local y=math.abs(root.Position.Y-target.Y)<8 and root.Position.Y or target.Y+3
+        root.CFrame=CFrame.new(target.X,y,target.Z)*root.CFrame.Rotation
+        root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+    end)
+    if ok then
+        auto.jumpedKey=auto.spot.key auto.settleUntil=os.clock()+.12
+        report.auto.teleports=report.auto.teleports+1 autoLog("local","TP",vec(target))
+    else auto.phase="TP indisponivel" autoLog("error","TP",tostring(err):sub(1,120)) end
+end
+onTreasure=function(action,...)
+    local args=table.pack(...)
+    if action=="Spot" then
+        local target=args[2]
+        if typeof(target)~="Vector3" then return end
+        local key=tostring(args[1])..string.format("/%.3f/%.3f",target.X,target.Z)
+        if not auto.spot or auto.spot.key~=key then
+            auto.spot={id=args[1],position=target,key=key,receivedAt=os.clock()}
+            auto.layer=nil auto.pending=nil auto.lastDig=-math.huge auto.jumpedKey=nil
+            if auto.enabled then auto.phase="Aguardando alcance para Dig" autoLog("server","Spot",{id=args[1],position=vec(target)}) end
+        end
+        if report.auto then report.auto.spot={id=args[1],position=vec(target)} end
+        if auto.enabled then jumpToSpot() end
+    elseif action=="Layer" then
+        if (type(args[1])~="number" and type(args[1])~="string") or type(args[2])~="number" then return end
+        local key=tostring(args[1]).."/"..tostring(args[3]).."/"..tostring(args[2])
+        if not auto.layer or auto.layer.key~=key then
+            auto.layer={id=args[1],started=args[2],index=args[3],center=args[4],width=args[5],receivedAt=os.clock(),key=key,armed=true}
+            auto.pending=nil auto.phase=auto.enabled and "Esperando o traco entrar no verde" or "OFF"
+        end
+        local record={token=args[1],started=args[2],index=args[3],center=args[4],width=args[5],argCount=args.n+1,extra={}}
+        for i=6,math.min(args.n,11) do record.extra[tostring(i+1)]=short(args[i],0,{left=12}) end
+        if report.auto then report.auto.layer=record end
+        autoLog("server","Layer",record)
+    elseif action=="Hit" then
+        if auto.enabled then
+            local pending=auto.pending auto.pending=nil
+            if pending and auto.layer and pending.layerKey==auto.layer.key then
+                if args[1]==true then
+                    report.auto.confirmedHits=report.auto.confirmedHits+1 auto.layer.completed=true
+                    auto.phase="Acerto confirmado; aguardando camada"
+                else
+                    report.auto.misses=report.auto.misses+1 auto.layer.armed=false auto.layer.retryAfter=os.clock()+.15
+                    auto.phase="Errou; aguardando proxima passagem"
+                end
+            end
+            autoLog("server","Hit",{accepted=args[1],value2=short(args[2],0,{left=8}),value3=short(args[3],0,{left=8})})
+        end
+    elseif action=="Found" then
+        if auto.enabled then
+            report.auto.foundWhileEnabled=report.auto.foundWhileEnabled+1
+            autoLog("server","Found",{item=short(args[1],0,{left=8}),amount=short(args[2],0,{left=8})})
+        end
+        auto.layer=nil auto.pending=nil auto.spot=nil auto.phase=auto.enabled and "Gamepass buscando o proximo ponto" or "OFF"
+        auto.waitingSince=os.clock()
+    elseif action=="Exit" or action=="Leave" then
+        auto.spot=nil auto.layer=nil auto.pending=nil auto.phase=auto.enabled and "Entre na praia com o detector" or "OFF"
+    end
+end
+autoStep=function()
+    if not auto.enabled or not running then return end
+    local now=os.clock()
+    if now<(auto.settleUntil or 0) then return end
+    if auto.layer then
+        local layer=auto.layer
+        if layer.completed then
+            if now-layer.receivedAt>2 and now-(auto.lastSync or 0)>2 then sync() end
+            return
+        end
+        if auto.pending then
+            if now-auto.pending.sentAt<1 then return end
+            autoLog("timeout","Strike") auto.pending=nil layer.armed=false layer.retryAfter=now+.15
+            report.auto.timeouts=report.auto.timeouts+1
+        end
+        local g=geometry()
+        if not g or not refs.track or not shown(refs.track) then auto.phase="Camada recebida; procurando faixa e traco" return end
+        if visual then
+            -- A automacao usa a faixa original mesmo durante o teste visual.
+            g.greenStart=visual.originalStart g.greenWidth=visual.originalWidth
+        end
+        local margin=math.min(.035,g.greenWidth*.12)
+        local inside=g.cursor>=g.greenStart+margin and g.cursor<=g.greenStart+g.greenWidth-margin
+        if not inside then layer.armed=true return end
+        if not layer.armed or now<(layer.retryAfter or 0) or now-layer.receivedAt<.025 then return end
+        local timestamp=serverNow() if not timestamp then auto.phase="Sem relogio para Strike" return end
+        layer.armed=false auto.pending={sentAt=now,layerKey=layer.key}
+        auto.phase="Enviando Strike no verde"
+        report.auto.strikes=report.auto.strikes+1
+        autoLog("send","Strike",{token=layer.id,time=timestamp,geometry=g})
+        if not send("Strike",layer.id,timestamp) then auto.pending=nil layer.retryAfter=now+.5 end
+        return
+    end
+    if not auto.spot then
+        auto.phase="Aguardando ponto da gamepass"
+        if now-(auto.waitingSince or now)>.8 then sync() end
+        return
+    end
+    jumpToSpot()
+    if now<(auto.settleUntil or 0) then return end
+    local p=position() if not p then auto.phase="Aguardando personagem" return end
+    local target=auto.spot.position local dx,dz=p.X-target.X,p.Z-target.Z
+    local _,signal=readHud()
+    local near=dx*dx+dz*dz<=3.2*3.2
+    if not near and (not signal or signal<90) then auto.phase="Gamepass aproximando do ponto" return end
+    if now-(auto.lastDig or -math.huge)<.45 then return end
+    auto.lastDig=now auto.phase="Iniciando Dig"
+    report.auto.digs=report.auto.digs+1 autoLog("send","Dig") send("Dig")
+end
+toggleAuto=function(value)
+    if value==nil then value=not auto.enabled end
+    if value and not running then start() end
+    auto.enabled=value==true and running
+    autoButton.Text=auto.enabled and "Auto Dig: ON" or "Auto Dig: OFF"
+    if report.auto then report.auto.enabled=auto.enabled end
+    if auto.enabled then
+        auto.waitingSince=os.clock() auto.lastDig=-math.huge
+        auto.phase="Aguardando estado da gamepass"
+        if auto.layer then auto.layer.armed=true auto.layer.completed=false end
+        sync() jumpToSpot()
+    else auto.phase="OFF" auto.pending=nil end
+end
+toggleTP=function(value)
+    if value==nil then value=not auto.tp end
+    auto.tp=value==true tpButton.Text=auto.tp and "TP ao ponto: ON" or "TP ao ponto: OFF"
+    if report.auto then report.auto.tp=auto.tp end
+    if auto.tp then jumpToSpot() end
 end
 
 testZone=function(value,preserveGameChange)
@@ -582,10 +764,12 @@ local function sampleState()
 end
 local function updateLabel()
     if visual then return end
-    if running then label.Text="Gravando: "..math.floor(at()).."/30 s\n"..(refs.button and "Dig detectado" or "Procurando o botao Dig...").." | "..#report.calls.." grupos de eventos\nComplete um ciclo normal; o teste da faixa e opcional."
+    if auto.enabled then label.Text=auto.phase.."\n"..(refs.zone and "Faixa/traco detectados" or "Aguardando a interface Dig").."\nUse Parar / copiar para enviar o teste."
+    elseif running then label.Text="Gravando: "..math.floor(at()).."/30 s\n"..(refs.button and "Dig detectado" or "Procurando o botao Dig...").." | "..#report.calls.." grupos de eventos\nComplete um ciclo normal; o teste da faixa e opcional."
     else label.Text="Parado. Use Copiar resultado para enviar o diagnostico." end
 end
 copy=function()
+    if report.auto then report.auto.phase=auto.phase report.auto.enabled=auto.enabled report.auto.geometry=geometry() end
     local export={} for k,v in pairs(report) do export[k]=v end
     export.running=running export.seconds=running and at() or (report.seconds or 0) export.dropped=(report.dropped or 0)+(probe.dropped or 0)
     export.calls={}
@@ -637,6 +821,7 @@ copy=function()
     return payload
 end
 stop=function(shouldCopy)
+    toggleAuto(false)
     if running then drain() testZone(false) running=false generation=generation+1 probe.enabled=false probe.allowed={} disconnect(sessionLinks)
         report.seconds=at() report.running=false end
     startButton.Text="Iniciar debug (30 s)" updateLabel()
@@ -647,12 +832,20 @@ start=function()
     started=os.clock() running=true generation=generation+1 local token=generation refs={objects={}}
     bound=setmetatable({}, {__mode="k"}) pendingButtons={} targetKeys={} groupKeys={} remoteInfo={} monitored={}
     lastPhase,lastLayer,lastHud="unknown",nil,"" movement=nil lastPos=nil lastPosAt=nil lastTap=-math.huge
-    report={format="dig-debug-v1",placeId=game.PlaceId,note="Somente observacao, exceto teste VISUAL opcional e reversivel. Aumento visual nao prova tolerancia real; alvos sao candidatos, nao TP validado. Cliques podem ser manuais ou da gamepass.",
+    auto={enabled=false,tp=auto.tp,phase="OFF",waitingSince=os.clock()}
+    report={format="dig-debug-v2-auto",placeId=game.PlaceId,note="Auto opcional: Dig e Strike no verde real, com horario atual. TP opcional so para Spot do servidor. Found conta enquanto ligado e nao distingue ajuda manual. Faixa visual ampliada nao prova acerto fora do original.",
         calls={},remoteInventory={},taps={},transitions={},messages={},targets={},movement={},visualTests={},dropped=0,logic={status="scanning",scripts={},signals={},functions={},states={}},world={},tools={}}
+    report.auto={enabled=false,tp=auto.tp,digs=0,strikes=0,confirmedHits=0,misses=0,foundWhileEnabled=0,teleports=0,timeouts=0,events={}}
     probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.allowed={} probe.seen={}
     local remotes=RS:FindFirstChild("Remotes")
     if remotes then for _,obj in ipairs(remotes:GetDescendants()) do attachRemote(obj) end listen(remotes.DescendantAdded,attachRemote) end
     local supported,err=installProbe() report.outgoingCapture=supported report.captureError=err probe.enabled=supported
+    listen(Run.RenderStepped,function()
+        if current(token) and auto.enabled then
+            local ok,err=pcall(autoStep)
+            if not ok then autoLog("error","controller",tostring(err):sub(1,180)) toggleAuto(false) auto.phase="Erro no controle; copie o resultado" end
+        end
+    end)
     listen(pg.DescendantAdded,function(obj)
         if obj:IsA("GuiButton") and not obj:IsDescendantOf(gui) then
             if #pendingButtons<320 then pendingButtons[#pendingButtons+1]=obj end
@@ -666,7 +859,7 @@ start=function()
     end)
     task.spawn(function()
         local refreshAt=-math.huge
-        while current(token) and at()<30 do
+        while current(token) and (at()<30 or auto.enabled) do
             drain()
             if at()-refreshAt>.5 then
                 refreshAt=at()
@@ -681,11 +874,13 @@ end
 close=function()
     if not alive then return end stop(false) alive=false disconnect(links) gui:Destroy()
 end
-env.DigDebug={Start=start,Stop=stop,Copy=copy,Close=close,TestZone=testZone,GetReport=function() return report end}
+env.DigDebug={Start=start,Stop=stop,Copy=copy,Close=close,TestZone=testZone,ToggleAuto=toggleAuto,ToggleTP=toggleTP,GetReport=function() return report end}
 listen(startButton.Activated,start,links)
 listen(stopButton.Activated,function() stop(true) end,links)
 listen(copyButton.Activated,copy,links)
 listen(testButton.Activated,function() testZone() end,links)
+listen(autoButton.Activated,function() toggleAuto() end,links)
+listen(tpButton.Activated,function() toggleTP() end,links)
 listen(exit.Activated,close,links)
 listen(minimize.Activated,function() mini.Position=panel.Position panel.Visible=false mini.Visible=true end,links)
 listen(mini.Activated,function() panel.Position=mini.Position panel.Visible=true mini.Visible=false end,links)
@@ -698,7 +893,7 @@ end,links)
 listen(UIS.InputChanged,function(input)
     if dragging and ((dragInput and input==dragInput) or (not dragInput and input.UserInputType==Enum.UserInputType.MouseMovement)) then
         local delta=input.Position-inputStart local view=workspace.CurrentCamera.ViewportSize
-        panel.Position=UDim2.fromOffset(math.clamp(panelStart.X.Offset+delta.X,0,math.max(0,view.X-330)),math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-265)))
+        panel.Position=UDim2.fromOffset(math.clamp(panelStart.X.Offset+delta.X,0,math.max(0,view.X-330)),math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-335)))
     end
 end,links)
 listen(UIS.InputEnded,function(input) if input==dragInput or input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end,links)
