@@ -55,7 +55,7 @@ Library.NotifyOnError=true
 local viewport=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
 local Window=Library:CreateWindow({
     Title="Neto Hub",
-    Footer="Neto Hub | v2.2 | Obsidian UI",
+    Footer="Neto Hub | v2.3 | Obsidian UI",
     Icon="triangle",
     Center=true,
     AutoShow=true,
@@ -136,6 +136,7 @@ local spam=newFeature("Spam","Spam Button",0.05)
 local potions=newFeature("Potions","Buy Potions",10)
 local floorUpgrades=newFeature("Floor","Floor Upgrades",0)
 local autoFish=newFeature("Fishing","Auto Fish",.001)
+local autoDig=newFeature("Dig","Auto Dig",0)
 local antiAFK=newFeature("AntiAFK","Anti-AFK",0)
 antiAFK.default=true
 coins.batch,coins.retry=25,3
@@ -1119,12 +1120,15 @@ local function pointIsFree(x,y)
             local ok,hits=pcall(function() return root:GetGuiObjectsAtPosition(x,y) end)
             if ok and type(hits)=="table" then
                 for _,obj in ipairs(hits) do
-                    if ownUI(obj) then return false end
+                    local belongs=ownUI(obj)
                     local a=obj
                     for _=1,10 do
                         if not a or a==root then break end
+                        if a:IsA("GuiObject") and not a.Visible then break end
                         if a:IsA("GuiButton") or a:IsA("TextBox") then return false end
                         if a.Name=="NetoFishingMobileRestore" then return false end
+                        -- Floats/Overlay da Obsidian ocupam a tela toda, mas nao consomem entrada.
+                        if belongs and a:IsA("GuiObject") and (a.Active==true or (a.BackgroundTransparency or 0)<.99) then return false end
                         a=a.Parent
                     end
                 end
@@ -1135,7 +1139,7 @@ local function pointIsFree(x,y)
 end
 local function position()
     local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
-    if os.clock()-clickPoint.at<.35 and view.X==clickPoint.vx and view.Y==clickPoint.vy then
+    if os.clock()-clickPoint.at<.35 and view.X==clickPoint.vx and view.Y==clickPoint.vy and clickPoint.x and pointIsFree(clickPoint.x,clickPoint.y) then
         return clickPoint.x,clickPoint.y
     end
     clickPoint.at=os.clock() clickPoint.vx=view.X clickPoint.vy=view.Y
@@ -1572,6 +1576,204 @@ end
 autoFish.release=function() if FishingController then FishingController.Toggle(false) end end
 autoFish.updateInterval=function(seconds) if FishingController then FishingController.SetInterval(seconds) end end
 
+-- Auto Dig incorporado: TP e Dig imediato fazem parte do mesmo controle.
+-- Nenhuma janela de debug, alteracao da faixa ou clique de tela.
+local function createDigController(onChanged)
+    local Run=game:GetService("RunService")
+    local active,closed=false,false
+    local generation=0
+    local links,markerLinks={},{}
+    local eventRemote,eventConnection=nil,nil
+    local refs,state={},{}
+    local busy=false
+    local pulse,toggle,onServer
+    local report={build="hub-dig-3.2",enabled=false,tp=true,digs=0,strikes=0,confirmedHits=0,misses=0,foundWhileEnabled=0,teleports=0,timeouts=0,phase="OFF"}
+    local function phase(text) report.phase=text autoDig.phase=text end
+    local function disconnect(list) for _,c in ipairs(list) do c:Disconnect() end for i=#list,1,-1 do list[i]=nil end end
+    local function listen(signal,fn,list)
+        ownCallbacks[fn]=true local c=signal:Connect(fn) local into=list or links into[#into+1]=c return c
+    end
+    local function shown(obj)
+        local p=obj
+        for _=1,16 do
+            if not p then return false end
+            if p:IsA("GuiObject") and not p.Visible then return false end
+            if p:IsA("ScreenGui") then return p.Enabled end
+            p=p.Parent
+        end
+        return false
+    end
+    local function graph()
+        local pg=player:FindFirstChild("PlayerGui") local front=pg and pg:FindFirstChild("Front")
+        local main=front and front:FindFirstChild("MainFrame") local hud=main and main:FindFirstChild("TreasureHUD")
+        local track=hud and hud:FindFirstChild("Track") local zone=track and track:FindFirstChild("Zone")
+        local needle=track and track:FindFirstChild("Needle")
+        if needle~=refs.needle then
+            disconnect(markerLinks)
+            if needle then
+                local token=generation
+                local function changed() if active and generation==token and pulse then pulse() end end
+                listen(needle:GetPropertyChangedSignal("Position"),changed,markerLinks)
+                listen(needle:GetPropertyChangedSignal("Visible"),changed,markerLinks)
+            end
+        end
+        refs={hud=hud,track=track,zone=zone,needle=needle,checked=os.clock()}
+        return hud,track,zone,needle
+    end
+    local function geometry()
+        if not refs.track or not refs.track.Parent or os.clock()-(refs.checked or 0)>.25 then graph() end
+        local t,z,n=refs.track,refs.zone,refs.needle
+        if not t or not z or not n or not shown(z) or not shown(n) or t.AbsoluteSize.X<=0 then return end
+        local cursor,lo,width,margin
+        if n.Parent==t and z.Parent==t and n.Position.X.Offset==0 and n.Size.X.Offset==0 and z.Position.X.Offset==0 and z.Size.X.Offset==0 then
+            width=z.Size.X.Scale lo=z.Position.X.Scale-z.AnchorPoint.X*width
+            cursor=n.Position.X.Scale+(.5-n.AnchorPoint.X)*n.Size.X.Scale margin=.006
+        else
+            width=z.AbsoluteSize.X/t.AbsoluteSize.X lo=(z.AbsolutePosition.X-t.AbsolutePosition.X)/t.AbsoluteSize.X
+            cursor=(n.AbsolutePosition.X+n.AbsoluteSize.X*.5-t.AbsolutePosition.X)/t.AbsoluteSize.X margin=.025
+        end
+        return cursor,lo,width,math.min(margin,width*.08)
+    end
+    local function bindRemote()
+        local current=remote("TreasureHunting")
+        if current~=eventRemote then
+            if eventConnection then eventConnection:Disconnect() eventConnection=nil end
+            eventRemote=current
+        end
+        if current and not eventConnection and active then
+            local token=generation
+            eventConnection=listen(current.OnClientEvent,function(...)
+                if active and generation==token then
+                    local ok,err=pcall(onServer,...)
+                    if not ok then report.error=tostring(err) toggle(false) phase("Erro no Auto Dig") if onChanged then onChanged(false,report.error) end end
+                end
+            end)
+        end
+        return current
+    end
+    local function send(action,...)
+        if not active then return false end
+        local r=bindRemote() if not r then phase("TreasureHunting indisponivel") return false end
+        r:FireServer(action,...) return true
+    end
+    local function sync(urgent)
+        if os.clock()-(state.lastSync or -math.huge)<(urgent and .05 or .25) then return end
+        state.lastSync=os.clock() send("Sync")
+    end
+    local function requestDig()
+        if not active or not state.spot or state.layer then return end
+        local now=os.clock() local retry=math.clamp((state.rtt or .06)*2+.02,.12,.3)
+        if now-(state.lastDig or -math.huge)<retry then return end
+        state.lastDig=now phase("Iniciando Dig") report.digs=report.digs+1
+        report.spotToDigMs=math.floor((now-state.spot.receivedAt)*1000+.5)
+        send("Dig")
+    end
+    local function jump()
+        if not active or not state.spot or state.jumpedKey==state.spot.key then return end
+        local _,_,root=body() if not root then phase("Aguardando personagem") return end
+        local p=state.spot.position
+        if (root.Position-p).Magnitude>500 then phase("Aguardando a area do detector") return end
+        local y=math.abs(root.Position.Y-p.Y)<8 and root.Position.Y or p.Y+3
+        root.CFrame=CFrame.new(p.X,y,p.Z)*root.CFrame.Rotation
+        root.AssemblyLinearVelocity=Vector3.new(0,0,0)
+        state.jumpedKey=state.spot.key report.teleports=report.teleports+1
+        requestDig()
+    end
+    onServer=function(action,...)
+        local a=table.pack(...)
+        if action=="Spot" and typeof(a[2])=="Vector3" then
+            local p=a[2] local key=tostring(a[1])..string.format("/%.3f/%.3f",p.X,p.Z)
+            if not state.spot or state.spot.key~=key then
+                state.spot={key=key,id=a[1],position=p,receivedAt=os.clock()}
+                state.layer=nil state.pending=nil state.jumpedKey=nil state.lastDig=-math.huge
+                report.spot={id=a[1],x=p.X,y=p.Y,z=p.Z}
+            end
+            jump()
+        elseif action=="Layer" and (type(a[1])=="number" or type(a[1])=="string") and type(a[2])=="number" then
+            local key=tostring(a[1]).."/"..tostring(a[3]).."/"..tostring(a[2])
+            if not state.layer or state.layer.key~=key then
+                state.layer={id=a[1],started=a[2],index=a[3],center=a[4],width=a[5],key=key,receivedAt=os.clock(),armed=true}
+                state.pending=nil phase("Aguardando o verde")
+            end
+            graph()
+        elseif action=="Hit" then
+            local p=state.pending state.pending=nil
+            if p and state.layer and p.key==state.layer.key then
+                local rtt=os.clock()-p.at state.rtt=state.rtt and state.rtt*.75+rtt*.25 or rtt
+                if a[1]==true then state.layer.completed=true state.layer.hitAt=os.clock() report.confirmedHits=report.confirmedHits+1
+                else state.layer.armed=false state.layer.retryAfter=os.clock()+.15 report.misses=report.misses+1 end
+            end
+        elseif action=="Found" then
+            report.foundWhileEnabled=report.foundWhileEnabled+1
+            state.layer=nil state.pending=nil state.spot=nil state.jumpedKey=nil
+            phase("Solicitando o proximo ponto") sync(true)
+        elseif action=="Exit" or action=="Leave" then
+            state.layer=nil state.pending=nil state.spot=nil state.jumpedKey=nil phase("Chegue perto da praia")
+        end
+    end
+    local function step()
+        local now=os.clock() local layer=state.layer
+        if layer then
+            if layer.completed then if now-(layer.hitAt or layer.receivedAt)>.4 then sync() end return end
+            if state.pending then
+                if now-state.pending.at<math.clamp((state.rtt or .07)*2.5+.025,.16,.55) then return end
+                state.pending=nil layer.armed=true layer.retryAfter=now report.timeouts=report.timeouts+1
+                layer.retries=(layer.retries or 0)+1 if layer.retries>2 then layer.retryAfter=now+.3 sync() end
+            end
+            local x,lo,width,margin=geometry()
+            if not x then phase("Aguardando o traco") return end
+            if type(layer.center)=="number" and type(layer.width)=="number" and (math.abs(lo+width*.5-layer.center)>.02 or math.abs(width-layer.width)>.02) then return end
+            if x<lo+margin or x>lo+width-margin then layer.armed=true return end
+            if not layer.armed or now<(layer.retryAfter or 0) then return end
+            local timestamp=workspace:GetServerTimeNow()
+            if timestamp<layer.started+.004 then return end
+            layer.armed=false state.pending={key=layer.key,at=now} report.strikes=report.strikes+1
+            phase("Strike no verde") send("Strike",layer.id,timestamp)
+            return
+        end
+        if not state.spot then sync() return end
+        jump() if state.layer then return end
+        local _,_,root=body() if not root then return end
+        local p=state.spot.position local dx,dz=root.Position.X-p.X,root.Position.Z-p.Z
+        if dx*dx+dz*dz<=3.2*3.2 then requestDig() end
+    end
+    pulse=function()
+        if not active or closed or busy then return end busy=true
+        local ok,err=pcall(step) busy=false
+        if not ok then report.error=tostring(err) toggle(false) phase("Erro no Auto Dig") if onChanged then onChanged(false,report.error) end end
+    end
+    toggle=function(value)
+        if closed then return end
+        active=false generation=generation+1
+        disconnect(links) disconnect(markerLinks) eventRemote=nil eventConnection=nil refs={}
+        state={} report.enabled=false phase("OFF")
+        if value~=true then return end
+        active=true report.enabled=true local token=generation
+        if not bindRemote() then active=false report.enabled=false phase("TreasureHunting indisponivel") if onChanged then onChanged(false,report.phase) end return end
+        graph()
+        listen(Run.RenderStepped,function() if active and generation==token then pulse() end end)
+        if Run.Heartbeat then listen(Run.Heartbeat,function() if active and generation==token then pulse() end end) end
+        phase("Buscando ponto do detector") sync(true)
+    end
+    return {Toggle=toggle,Report=report,IsEnabled=function() return active end,
+        Close=function() if not closed then toggle(false) closed=true end end}
+end
+local DigController=nil
+local function getDigController()
+    if not DigController then
+        if env.DigDebug and type(env.DigDebug.Close)=="function" then pcall(env.DigDebug.Close) end
+        DigController=createDigController(function(on,reason)
+            if autoDig.toggle and autoDig.toggle.Value~=on then autoDig.toggle:SetValue(on) end
+            if not on and reason then notify("Auto Dig: "..tostring(reason)) end
+        end)
+    end
+    return DigController
+end
+autoDig.validate=function() return remote("TreasureHunting")~=nil,"TreasureHunting nao encontrado." end
+autoDig.start=function() getDigController().Toggle(true) end
+autoDig.release=function() if DigController then DigController.Toggle(false) end end
+
+
 -- Anti-AFK orientado ao evento de inatividade, independente da pesca.
 local AntiAFK=(function()
     local idleConnection,virtualUser=nil,nil
@@ -1633,6 +1835,7 @@ local tabs={
     Purchases=Window:AddTab("Coins / Compras","shopping-cart"),
     Spam=Window:AddTab("Spam Button","scan"),
     Fishing=Window:AddTab("Pesca / Utilidades","fish"),
+    Dig=Window:AddTab("Auto Dig","shovel"),
 }
 local layout={
     {f=cash,tab=tabs.Droppers,side="Left"},
@@ -1644,6 +1847,7 @@ local layout={
     {f=potions,tab=tabs.Purchases,side="Right"},
     {f=spam,tab=tabs.Spam,side="Left"},
     {f=autoFish,tab=tabs.Fishing,side="Left"},
+    {f=autoDig,tab=tabs.Dig,side="Left"},
     {f=antiAFK,tab=tabs.Fishing,side="Right"},
 }
 local panelListBox,rows={},{}
@@ -1652,7 +1856,7 @@ for _,item in ipairs(layout) do
     local control=item.tab:AddGroupbox({Side=item.side,Name=f.title})
     control:AddToggle(f.id.."Enabled",{Text=f.title,Default=f.default==true})
     f.toggle=Toggles[f.id.."Enabled"]
-    if f~=floorUpgrades and f~=potions and f~=antiAFK then intervalControls(control,f) end
+    if f~=floorUpgrades and f~=potions and f~=antiAFK and f~=autoDig then intervalControls(control,f) end
     if f==coins then
         control:AddSlider("CoinsBatch",{Text="Moedas por lote",Default=25,Min=1,Max=50,Rounding=0})
         control:AddInput("CoinsRetry",{Text="Repetir pedido pendente (s)",Default="3",Numeric=false,Finished=false,ClearTextOnFocus=false})
@@ -1893,7 +2097,7 @@ if SaveManager and filesystem then
     local ok,err=pcall(function()
         SaveManager:SetLibrary(Library)
         SaveManager:IgnoreThemeSettings()
-        SaveManager:SetIgnoreIndexes({"CashEnabled","BronzeEnabled","CoinsEnabled","CombatEnabled","TreeEnabled","SpamEnabled","PotionsEnabled","FloorEnabled","FishingEnabled","AntiAFKEnabled","MenuKeybind"})
+        SaveManager:SetIgnoreIndexes({"CashEnabled","BronzeEnabled","CoinsEnabled","CombatEnabled","TreeEnabled","SpamEnabled","PotionsEnabled","FloorEnabled","FishingEnabled","DigEnabled","AntiAFKEnabled","MenuKeybind"})
         SaveManager:SetFolder("NetoHub/"..tostring(game.PlaceId))
         SaveManager:BuildConfigSection(settingsTab)
         SaveManager:LoadAutoloadConfig()
@@ -1911,6 +2115,7 @@ local function cleanup()
     Purchases.Close()
     AntiAFK.Close()
     if FishingController then FishingController.Close() end
+    if DigController then DigController.Close() end
     alive=false
     for _,c in ipairs(connections) do c:Disconnect() end
     spam.release()
@@ -1924,8 +2129,8 @@ env.NetoHubCleanup=function()
 end
 env.NetoHub={Features=features,Library=Library,Window=Window,StopAll=stopAll,
     PanelEntries=panelEntries,RemovePanel=removePanelEntry,StartScan=env.NetoHubStartScan,
-    GetFishingController=getFishingController}
-for _,name in ipairs({"FishingDebug","FishingAutoTest"}) do
+    GetFishingController=getFishingController,GetDigController=getDigController}
+for _,name in ipairs({"FishingDebug","FishingAutoTest","DigDebug"}) do
     if env[name] and type(env[name].Close)=="function" then pcall(env[name].Close) end
 end
 -- Encerra as versoes antigas para evitar loops duplicados.
