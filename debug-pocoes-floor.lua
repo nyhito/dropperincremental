@@ -37,6 +37,7 @@ local injecting=0
 local injectedInputs=setmetatable({}, {__mode="k"})
 local nextModeScan=0
 local inputUnavailableAt=nil
+local actorRevision=-1
 local modeIndex=1
 local modes={}
 local inputWorking=false
@@ -52,7 +53,7 @@ local startDropDebug,stopDropDebug
 local geometry={}
 local autoButton=nil
 local toggle,close,copy,setHeld,click,chooseMode
-local report={format="fishing-controller-v5-native-bridge",placeId=game.PlaceId,
+local report={format="fishing-controller-v6-actor-context",placeId=game.PlaceId,
     note="Chama funcoes locais, sem ponteiro virtual. Controla a barra real. Caught so conta no ciclo iniciado/controlado pelo auto. Nao comprova remocao dos tempos de queda/mordida.",
     caught=0,escaped=0,manualOrUnownedCaught=0,manualTouches=0,castsAccepted=0,bites=0,clicks=0,holdChanges=0,catchRequests=0,
     events={},catches={},inputErrors={},capabilities={},recastDelay=0}
@@ -112,6 +113,13 @@ local function progress()
     local text=bar and bar:FindFirstChild("Percent")
     local value=text and tonumber(((text.Text:match("[%d.,]+") or ""):gsub(",",".")))
     return bar and bar.Visible or false,value
+end
+local function isInputObject(value)
+    local kind=typeof(value)
+    if kind=="InputObject" then return true end
+    if kind~="Instance" then return false end
+    local ok,result=pcall(function() return value:IsA("InputObject") end)
+    return ok and result
 end
 local function sourceOf(fn,c)
     local source
@@ -222,7 +230,9 @@ local function callbacks(signal,origin)
                 or (lower:find("playerscripts",1,true) and lower:find("fish",1,true) and 90)
                 or (lower:find("client.main",1,true) and 85) or 0
             local evidence={}
-            if not lower:find("corepackages",1,true) and not lower:find("playermodule",1,true) then
+            local core=lower:find("corepackages",1,true) or lower:find("coregui",1,true) or lower:find("playermodule",1,true)
+            if core then score=0 end
+            if not core then
                 local match,why=fishingFingerprint(fn)
                 if match>=60 then score=200+match evidence=why end
             end
@@ -304,67 +314,388 @@ local function inputPacket(down,kind,reuse)
     injectedInputs[input]=os.clock()
     return input
 end
-local function signalPair(name,beginSignal,endSignal)
-    if not beginSignal or not endSignal then return end
-    local nativeBegin=nativeBindings(beginSignal,name..".Begin")
-    local nativeEnd=nativeBindings(endSignal,name..".End")
-    if #nativeBegin>0 and #nativeEnd>0 then
-        modes[#modes+1]={name=name.." / conexoes nativas",press=function(down)
-            emitForeign(down and nativeBegin or nativeEnd)
-        end}
+local ACTOR_WORKER_SOURCE=[===[
+pcall(function() if task.synchronize then task.synchronize() end end)
+local Players=game:GetService("Players")
+local UIS=game:GetService("UserInputService")
+local RS=game:GetService("ReplicatedStorage")
+local HTTP=game:GetService("HttpService")
+local player=Players.LocalPlayer
+local bridge=player:WaitForChild("PlayerGui"):FindFirstChild(bridgeName)
+if not bridge then return end
+local command=bridge:FindFirstChild("Command")
+local response=bridge:FindFirstChild("Response")
+if not command or not response then return end
+local fishing=RS:WaitForChild("Remotes"):FindFirstChild("Fishing")
+local env=(type(getgenv)=="function" and getgenv()) or _G
+local ownCallbacks={}
+local observedFunctions,boundFunctions={},{}
+local fingerprintCache=setmetatable({}, {__mode="k"})
+local report={}
+local function sourceOf(fn,c)
+    local source
+    pcall(function()
+        if type(getfenv)=="function" then
+            local scope=getfenv(fn)
+            if scope and typeof(scope.script)=="Instance" then source=scope.script:GetFullName() end
+        end
+    end)
+    if not source then pcall(function() if c.Thread and type(getscriptfromthread)=="function" then source=getscriptfromthread(c.Thread):GetFullName() end end) end
+    if not source then pcall(function() if debug and debug.info then source=debug.info(fn,"s") end end) end
+    return tostring(source or "")
+end
+local function constantsOf(fn)
+    local reader=debug and debug.getconstants
+    if type(reader)~="function" then return {} end
+    local ok,result=pcall(reader,fn)
+    return ok and type(result)=="table" and result or {}
+end
+local function field(obj,key,errors)
+    local ok,value=pcall(function() return obj[key] end)
+    if not ok and errors then errors[key]=tostring(value):sub(1,110) end
+    if ok then return value end
+    return nil
+end
+local function fishingFingerprint(root)
+    local cached=fingerprintCache[root] if cached then return cached.score,cached.evidence end
+    local queue={{value=root,depth=0,label="fn"}}
+    local seen={} local index,budget,score=1,44,0
+    local evidence={}
+    local function hit(points,label)
+        score=math.max(score,points)
+        if #evidence<5 then evidence[#evidence+1]=label end
     end
-    local fire=firesignal or env.firesignal
-    local b=report.nativeDiscovery[name..".Begin"]
-    local e=report.nativeDiscovery[name..".End"]
-    local listenersUnknown=type(getconnections or env.getconnections)~="function"
-    if type(fire)=="function" and (listenersUnknown or (b and e and b.total>0 and e.total>0)) then
-        modes[#modes+1]={name=name.." / sinal local",press=function(down)
-            injecting=injecting+1
-            local ok,err=pcall(fire,down and beginSignal or endSignal)
-            injecting=injecting-1
-            if not ok then error(err) end
-        end}
+    while index<=#queue and budget>0 and score<85 do
+        local item=queue[index] index=index+1
+        local v=item.value
+        if not seen[v] then
+            seen[v]=true budget=budget-1
+            if type(v)=="function" and not ownCallbacks[v] then
+                local fish,action=false,false
+                for _,x in pairs(constantsOf(v)) do
+                    if x=="Fishing" or x=="FishingRod" or x=="ReelBar" then fish=true end
+                    if x=="Cast" or x=="Hook" or x=="Catch" or x=="Bite" then action=true end
+                end
+                if fish and action then hit(85,item.label..": fishing actions")
+                elseif fish then hit(65,item.label..": fishing reference") end
+                if item.depth<3 and debug and type(debug.getupvalues)=="function" then
+                    local ok,values=pcall(debug.getupvalues,v)
+                    if ok and type(values)=="table" then
+                        local n=0
+                        for key,x in next,values do
+                            n=n+1 if n>32 or #queue>=80 then break end
+                            if type(key)=="string" and (key:lower():find("fish",1,true) or key:lower():find("reel",1,true)) then hit(65,item.label..":"..key) end
+                            if type(x)=="function" or type(x)=="table" or typeof(x)=="Instance" then
+                                queue[#queue+1]={value=x,depth=item.depth+1,label=item.label.."/uv"..tostring(key):sub(1,25)}
+                            end
+                        end
+                    end
+                end
+            elseif typeof(v)=="Instance" then
+                if v==fishing then hit(85,item.label..": Fishing remote")
+                else
+                    local name=v.Name:lower()
+                    if name=="reelbar" or name=="fishingrod" then hit(70,item.label..": "..v.Name) end
+                end
+            elseif type(v)=="table" and item.depth<3 and v~=_G and v~=env then
+                local n=0
+                for key,x in next,v do
+                    n=n+1 if n>32 or #queue>=80 then break end
+                    if key=="Fishing" or key=="ReelBar" or key=="FishingRod" then hit(65,item.label..":"..tostring(key)) end
+                    if type(x)=="function" or (type(x)=="table" and item.depth<2) or typeof(x)=="Instance" then
+                        queue[#queue+1]={value=x,depth=item.depth+1,label=item.label.."/"..tostring(key):sub(1,25)}
+                    end
+                end
+            end
+        end
+    end
+    fingerprintCache[root]={score=score,evidence=evidence}
+    return score,evidence
+end
+local function callbacks(signal,origin)
+    local list=getconnections or env.getconnections
+    origin=origin or "unknown"
+    report.discovery=report.discovery or {}
+    local summary={total=0,accessible=0,selected=0,records={}}
+    report.discovery[origin]=summary
+    if type(list)~="function" or not signal then summary.error="getconnections/sinal indisponivel" return {} end
+    local ok,all=pcall(list,signal)
+    if not ok or type(all)~="table" then summary.error=tostring(all):sub(1,160) return {} end
+    local candidates,best={},0
+    for key,c in pairs(all) do
+        summary.total=summary.total+1
+        if summary.total>1024 then summary.truncated=true break end
+        local errors={}
+        -- Campos opcionais NAO podem invalidar Function. Alguns executores lancam erro ao le-los.
+        local fn=type(c)=="function" and c or field(c,"Function",errors)
+        if type(fn)~="function" and type(c)~="function" then fn=field(c,"Callback",errors) end
+        local on,foreign
+        if type(c)~="function" then on=field(c,"Enabled",errors) foreign=field(c,"ForeignState",errors) end
+        local row={index=tostring(key),functionType=type(fn),enabled=on,foreign=foreign}
+        if next(errors) then row.fieldErrors=errors end
+        if type(fn)=="function" and not ownCallbacks[fn] and on~=false and foreign~=true then
+            summary.accessible=summary.accessible+1
+            local source=sourceOf(fn,type(c)=="function" and {} or c)
+            local lower=source:lower()
+            local score=(lower:find("playerscripts.client.main",1,true) and 100)
+                or (lower:find("playerscripts",1,true) and lower:find("fish",1,true) and 90)
+                or (lower:find("client.main",1,true) and 85) or 0
+            local evidence={}
+            local core=lower:find("corepackages",1,true) or lower:find("coregui",1,true) or lower:find("playermodule",1,true)
+            if core then score=0 end
+            if not core then
+                local match,why=fishingFingerprint(fn)
+                if match>=60 then score=200+match evidence=why end
+            end
+            row.source=source:sub(1,180) row.score=score row.evidence=evidence
+            local entry={fn=fn,source=source,score=score,origin=origin,evidence=evidence}
+            observedFunctions[fn]=entry
+            if score>=60 then candidates[#candidates+1]=entry best=math.max(best,score) end
+        end
+        if #summary.records<8 then summary.records[#summary.records+1]=row
+        elseif row.score and row.score>=60 then
+            for i,old in ipairs(summary.records) do if not old.score or old.score<60 then summary.records[i]=row break end end
+        end
+    end
+    local selected={}
+    for _,c in ipairs(candidates) do
+        if c.score==best then selected[#selected+1]=c boundFunctions[c.fn]=c end
+    end
+    summary.selected=#selected
+    return selected
+end
+local function safe(v,depth,budget)
+    budget.left=budget.left-1
+    if budget.left<0 then return "[limit]" end
+    local kind=typeof(v)
+    if kind=="nil" then return {type="nil"} end
+    if kind=="string" then return v:sub(1,140) end
+    if kind=="boolean" then return v end
+    if kind=="number" then return v==v and v~=math.huge and v~=-math.huge and v or tostring(v) end
+    if kind=="Instance" then return {type=kind,path=v:GetFullName()} end
+    if kind=="Vector3" then return {type=kind,x=v.X,y=v.Y,z=v.Z} end
+    if kind=="table" and depth<2 then
+        local out,n={},0
+        for k,x in pairs(v) do n=n+1 if n>6 or budget.left<=0 then break end out[tostring(k)]=safe(x,depth+1,budget) end
+        return out
+    end
+    return {type=kind,value=tostring(v):sub(1,140)}
+end
+
+local began=callbacks(UIS.InputBegan,"InputBegan")
+local ended=callbacks(UIS.InputEnded,"InputEnded")
+local summary={id=actorId,beginCount=#began,endCount=#ended,sources={},score=0,discovery=report.discovery}
+for _,binding in ipairs(began) do summary.score=summary.score+binding.score if #summary.sources<6 then summary.sources[#summary.sources+1]=binding.source end end
+for _,binding in ipairs(ended) do summary.score=summary.score+binding.score end
+local workerAlive,pressed=true,false
+local workerInput=nil
+local epoch=0
+local commandLink,ancestryLink
+local function reply(kind,data)
+    if bridge.Parent then pcall(function() response:Fire(kind,actorId,HTTP:JSONEncode(data)) end) end
+end
+local function dispatch(down,kind,realInput)
+    if down then
+        local view=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1000,700)
+        local isReal=false
+        pcall(function() isReal=typeof(realInput)=="Instance" and realInput:IsA("InputObject") end)
+        workerInput=isReal and realInput or {UserInputType=kind=="touch" and Enum.UserInputType.Touch or Enum.UserInputType.MouseButton1,
+            UserInputState=Enum.UserInputState.Begin,KeyCode=Enum.KeyCode.Unknown,
+            Position=Vector3.new(math.floor(view.X*.78),math.floor(view.Y*.3),0),Delta=Vector3.new(0,0,0)}
+    end
+    local packet=workerInput
+    if not packet then return end
+    if typeof(packet)=="table" then packet.UserInputState=down and Enum.UserInputState.Begin or Enum.UserInputState.End end
+    pressed=down
+    local selected=down and began or ended
+    local expected=epoch
+    for _,binding in ipairs(selected) do
+        task.spawn(function()
+            if down and (not workerAlive or expected~=epoch) then return end
+            local ok,err=pcall(binding.fn,packet,false)
+            if not ok then reply("error",{error=tostring(err):sub(1,240),down=down,inputKind=kind}) end
+        end)
+    end
+    if not down then workerInput=nil end
+end
+local function inspectFunctions()
+    local out={functions={},capabilities={getconstants=debug and type(debug.getconstants)=="function",getupvalues=debug and type(debug.getupvalues)=="function"}}
+    local queue,seen={},{}
+    for _,b in ipairs(began) do queue[#queue+1]={fn=b.fn,depth=0,origin="InputBegan"} end
+    for _,b in ipairs(ended) do queue[#queue+1]={fn=b.fn,depth=0,origin="InputEnded"} end
+    for _,b in ipairs(callbacks(fishing.OnClientEvent,"Fishing.OnClientEvent")) do queue[#queue+1]={fn=b.fn,depth=0,origin="Fishing.OnClientEvent"} end
+    local index=1
+    while index<=#queue and #out.functions<10 do
+        local item=queue[index] index=index+1
+        if not seen[item.fn] then
+            seen[item.fn]=true
+            local entry={origin=item.origin,source=sourceOf(item.fn,{}),constants={},upvalues={}}
+            for key,value in pairs(constantsOf(item.fn)) do
+                if #entry.constants>=20 then break end
+                local match=type(value)=="number"
+                if type(value)=="string" then
+                    local lower=value:lower()
+                    for _,word in ipairs({"fish","cast","tween","duration","delay","drop","bobber","flight","velocity","lerp","animation","wait","input","mouse","touch","begin"}) do
+                        if lower:find(word,1,true) then match=true break end
+                    end
+                end
+                if match then entry.constants[#entry.constants+1]={key=tostring(key),value=safe(value,0,{left=4})} end
+            end
+            if debug and type(debug.getupvalues)=="function" then
+                local ok,values=pcall(debug.getupvalues,item.fn)
+                if ok and type(values)=="table" then
+                    local n=0
+                    for key,value in pairs(values) do
+                        n=n+1 if n>40 then break end
+                        if type(value)=="function" and item.depth<2 and #queue<30 then
+                            queue[#queue+1]={fn=value,depth=item.depth+1,origin=item.origin.."/"..tostring(key)}
+                        elseif #entry.upvalues<6 and (type(value)=="number" or typeof(value)=="Vector3" or typeof(value)=="Instance") then
+                            entry.upvalues[#entry.upvalues+1]={key=tostring(key),value=safe(value,0,{left=5})}
+                        elseif #entry.upvalues<6 and type(value)=="table" and value~=_G and value~=env then
+                            local subset,m={},0
+                            for k,v in next,value do
+                                m=m+1 if m>40 then break end
+                                local lower=tostring(k):lower()
+                                if lower:find("fish",1,true) or lower:find("cast",1,true) or lower:find("tween",1,true) or lower:find("duration",1,true) then subset[tostring(k)]=safe(v,0,{left=8}) end
+                            end
+                            if next(subset) then entry.upvalues[#entry.upvalues+1]={key=tostring(key),value=subset} end
+                        end
+                    end
+                end
+            end
+            out.functions[#out.functions+1]=entry
+        end
+    end
+    return out
+end
+
+local function cleanup()
+    if not workerAlive then return end
+    epoch=epoch+1
+    if pressed then dispatch(false,"mouse") end
+    workerAlive=false
+    if commandLink then commandLink:Disconnect() end
+    if ancestryLink then ancestryLink:Disconnect() end
+end
+commandLink=command.Event:Connect(function(target,action,down,kind,realInput)
+    if target~="*" and target~=actorId then return end
+    if action=="close" then cleanup() return end
+    if action=="diagnose" and workerAlive then reply("diagnostic",inspectFunctions()) return end
+    if not workerAlive or #began==0 or #ended==0 then return end
+    if action=="release" then epoch=epoch+1 if pressed then dispatch(false,kind) end return end
+    if action=="press" then dispatch(down==true,kind,realInput) end
+end)
+ancestryLink=bridge.AncestryChanged:Connect(function(_,parent) if not parent then cleanup() end end)
+reply("probe",summary)
+
+]===]
+-- Sonda cada Actor sem acionar controles; so o contexto selecionado recebe comandos.
+local actorState={started=false,scanning=false,ready=false,revision=0,selected=nil,folder=nil,candidates={},generation=0}
+report.actors={status="not_started",candidates={},errors={}}
+local function actorMessage(message)
+    local errors=report.actors.errors
+    errors[#errors+1]=tostring(message):sub(1,220)
+    if #errors>6 then table.remove(errors,1) end
+end
+local function stopActors(destroy)
+    if actorState.folder and actorState.folder.Parent then
+        local command=actorState.folder:FindFirstChild("Command")
+        if command then pcall(function() command:Fire("*",destroy and "close" or "release",false,"mouse") end) end
+        if destroy then actorState.folder:Destroy() actorState.folder=nil end
     end
 end
-local function addNativeModes(tool)
-    if not tool then return end
-    -- Activate/Deactivate pertencem a ferramenta; nao fazem hit-test de botoes da tela.
-    modes[#modes+1]={name="FishingRod / Activate",press=function(down)
-        local r=rod() or tool
-        if down then r:Activate() else r:Deactivate() end
-    end}
-    pcall(function()
-        local mouse=player:GetMouse()
-        if mouse then signalPair("Mouse.Button1",mouse.Button1Down,mouse.Button1Up) end
-    end)
-    signalPair("FishingRod.Events",tool.Activated,tool.Deactivated)
-    local begins=nativeBindings(UIS.InputBegan,"UIS.InputBegan")
-    local ends=nativeBindings(UIS.InputEnded,"UIS.InputEnded")
-    local kinds={Enum.UserInputType.MouseButton1,Enum.UserInputType.Touch}
-    if #begins>0 and #ends>0 then
-        local variants=lastRealInput and {"real","mouse","touch"} or {"mouse","touch"}
-        for _,variant in ipairs(variants) do
-            local mode=variant
-            modes[#modes+1]={name="UIS / conexoes nativas / "..mode,press=function(down)
-                local kind=mode=="touch" and kinds[2] or kinds[1]
-                emitForeign(down and begins or ends,inputPacket(down,kind,mode=="real"),false)
-            end}
+local function startActorProbe()
+    if actorState.started then return end
+    actorState.started=true
+    local inventory=getactors or env.getactors
+    local runActor=run_on_actor or env.run_on_actor
+    if type(inventory)~="function" or type(runActor)~="function" then report.actors.status="api_unavailable" return end
+    local list={}
+    local seen={}
+    local function add(candidate,priority)
+        local ok,isActor=pcall(function() return typeof(candidate)=="Instance" and candidate:IsA("Actor") end)
+        if ok and isActor and not seen[candidate] then
+            seen[candidate]=true
+            local name="Actor" pcall(function() name=candidate:GetFullName() end)
+            list[#list+1]={actor=candidate,path=name,priority=priority or (name:lower():find("playerscripts",1,true) and 20 or 0)}
         end
     end
-    local fire=firesignal or env.firesignal
-    if type(fire)=="function" then
-        local variants=lastRealInput and {"real","mouse","touch"} or {"mouse","touch"}
-        for _,variant in ipairs(variants) do
-            local mode=variant
-            modes[#modes+1]={name="UIS / sinal local / "..mode,press=function(down)
-                local kind=mode=="touch" and kinds[2] or kinds[1]
-                local packet=inputPacket(down,kind,mode=="real")
-                injecting=injecting+1
-                local ok,err=pcall(fire,down and UIS.InputBegan or UIS.InputEnded,packet,false)
-                injecting=injecting-1
-                if not ok then error(err) end
-            end}
+    local ps=player:FindFirstChild("PlayerScripts")
+    local client=ps and ps:FindFirstChild("Client")
+    local main=client and client:FindFirstChild("Main")
+    if main then pcall(function() add(main:GetActor(),100) end) end
+    local ok,actors=pcall(inventory)
+    if not ok or type(actors)~="table" then report.actors.status="inventory_failed" actorMessage(actors) return end
+    local rawCount=0
+    for _,candidate in pairs(actors) do rawCount=rawCount+1 if rawCount>128 then break end add(candidate) end
+    report.actors.inventoryCount=rawCount
+    if #list==0 then report.actors.status="no_actor_instances" return end
+    table.sort(list,function(a,b) return a.priority>b.priority end)
+    report.actors.eligibleActors=#list
+    report.actors.probedActors=math.min(#list,12)
+    report.actors.inventoryTruncated=#list>12 or rawCount>128
+    while #list>12 do table.remove(list) end
+    local folder=Instance.new("Folder")
+    folder.Name="NetoFishActor_"..tostring(math.floor(os.clock()*1000000))
+    folder.Parent=player:WaitForChild("PlayerGui")
+    local command=Instance.new("BindableEvent") command.Name="Command" command.Parent=folder
+    local response=Instance.new("BindableEvent") response.Name="Response" response.Parent=folder
+    actorState.folder=folder actorState.scanning=true
+    actorState.generation=actorState.generation+1 local generation=actorState.generation
+    report.actors.status="probing"
+    local bestScore=-1
+    connect(response.Event,function(kind,id,payload)
+        if not alive or generation~=actorState.generation then return end
+        local parsed,data=pcall(function() return Http:JSONDecode(payload) end)
+        if not parsed or type(data)~="table" then actorMessage("Resposta de Actor invalida") return end
+        if kind=="probe" then
+            data.path=actorState.candidates[id] and actorState.candidates[id].path
+            report.actors.candidates[#report.actors.candidates+1]={id=id,path=data.path,beginCount=data.beginCount,endCount=data.endCount,score=data.score,sources=data.sources}
+            local priority=actorState.candidates[id] and actorState.candidates[id].priority or 0
+            local rank=data.score+priority*1000
+            if data.beginCount>0 and data.endCount>0 and rank>bestScore then
+                bestScore=rank
+                report.actors.selectedDiscovery=data.discovery actorState.selected=id actorState.ready=true
+                actorState.revision=actorState.revision+1
+                report.actors.selected=id report.actors.status="context_found"
+            end
+        elseif kind=="diagnostic" and id==actorState.selected then
+            report.actors.functionDiagnostic=data
+            if dropDebug then dropDebug.actorFunctions=data end
+        elseif kind=="error" and id==actorState.selected then
+            actorMessage(data.error)
+            local mode=modes[modeIndex]
+            if enabled and mode and mode.actor and mode.actorVariant==data.inputKind then inputError("Actor: "..tostring(data.error)) end
         end
+    end)
+    task.spawn(function()
+        for i,entry in ipairs(list) do
+            if not alive or actorState.generation~=generation or not folder.Parent then return end
+            local id=tostring(i) actorState.candidates[id]=entry
+            local source="local bridgeName,actorId="..string.format("%q",folder.Name)..","..string.format("%q",id).."\n"..ACTOR_WORKER_SOURCE
+            local dispatched,err=pcall(runActor,entry.actor,source)
+            if not dispatched then actorMessage(entry.path..": "..tostring(err)) end
+            task.wait()
+        end
+        local began=os.clock()
+        while alive and generation==actorState.generation and not actorState.ready and os.clock()-began<2 do task.wait(.05) end
+        if generation~=actorState.generation then return end
+        actorState.scanning=false actorState.revision=actorState.revision+1
+        if not actorState.ready then report.actors.status="no_fishing_context" end
+    end)
+end
+local function addActorModes()
+    if not actorState.ready or not actorState.folder or not actorState.folder.Parent then return end
+    local id=actorState.selected
+    local command=actorState.folder:FindFirstChild("Command")
+    if not command then return end
+    local variants=lastRealInput and {"mouse","touch","real"} or {"mouse","touch"}
+    for _,variant in ipairs(variants) do
+        local mode=variant
+        modes[#modes+1]={name="Actor "..id.." / "..mode,actor=true,actorVariant=mode,press=function(down)
+            local input=mode=="real" and lastRealInput or nil
+            command:Fire(id,"press",down,mode,input)
+        end}
     end
 end
 
@@ -414,8 +745,28 @@ local function refreshModes()
             end}
         end
     end
-    addNativeModes(tool)
-    local preferred=env.__NetoFishingInputMethod
+    -- Nao repete as pontes de input falso que falharam no executor.
+    -- O contexto do Actor tem prioridade; o fallback aceita apenas um InputObject real.
+    if actorState.ready then
+        local localModes=modes modes={} addActorModes()
+        for _,mode in ipairs(localModes) do modes[#modes+1]=mode end
+    elseif #begins==0 or #ends==0 then startActorProbe() end
+    if tool and lastRealInput then
+        local nativeBegin=nativeBindings(UIS.InputBegan,"UIS.InputBegan")
+        local nativeEnd=nativeBindings(UIS.InputEnded,"UIS.InputEnded")
+        if #nativeBegin>0 and #nativeEnd>0 then
+            modes[#modes+1]={name="UIS / objeto real / nativo",press=function(down)
+                emitForeign(down and nativeBegin or nativeEnd,inputPacket(down,Enum.UserInputType.Touch,true),false)
+            end}
+        end
+        local fire=firesignal or env.firesignal
+        if type(fire)=="function" then modes[#modes+1]={name="UIS / objeto real / sinal",press=function(down)
+            local packet=inputPacket(down,Enum.UserInputType.Touch,true)
+            injecting=injecting+1 local ok,err=pcall(fire,down and UIS.InputBegan or UIS.InputEnded,packet,false) injecting=injecting-1
+            if not ok then error(err) end
+        end} end
+    end
+    local preferred=env.__NetoFishingInputSchema=="actor-v6" and env.__NetoFishingInputMethod or nil
     for i,mode in ipairs(modes) do if mode.name==preferred then table.remove(modes,i) table.insert(modes,1,mode) break end end
     modeIndex=1 modeFault=false
     report.capabilities={getconnections=type(getconnections or env.getconnections)=="function",getconstants=debug and type(debug.getconstants)=="function",getupvalues=debug and type(debug.getupvalues)=="function",inputModes=#modes,physicalInput=false,firesignal=type(firesignal or env.firesignal)=="function",realInput=lastRealInput~=nil,nativeMethods=true,actorBridge=type(run_on_actor or env.run_on_actor)=="function",actorInventory=type(getactors or env.getactors)=="function"}
@@ -524,6 +875,10 @@ startDropDebug=function()
         getconstants=debug and type(debug.getconstants)=="function",
         getupvalues=debug and type(debug.getupvalues)=="function"}}
     dropDebug=d report.dropDebug=d
+    if actorState.ready and actorState.folder and actorState.folder.Parent then
+        local command=actorState.folder:FindFirstChild("Command")
+        if command then command:Fire(actorState.selected,"diagnose") end
+    end
     dropButton.Text="Parar debug / copiar"
     local physical,stateSources,fnSeen={},{},{}
     local function watch(obj)
@@ -710,8 +1065,9 @@ local function onServer(action,...)
         if stage=="casting" and autoOwned then
             stage="waitingBite" stateAt=os.clock() clickCount=0
             report.castsAccepted=report.castsAccepted+1
-            inputWorking=true phase="Lancamento confirmado; aguardando !"
-            if modes[modeIndex] then env.__NetoFishingInputMethod=modes[modeIndex].name end
+            if not manualAssisted then inputWorking=true else report.manualCastAccepted=(report.manualCastAccepted or 0)+1 end
+            phase="Lancamento confirmado; aguardando !"
+            if modes[modeIndex] and not manualAssisted then env.__NetoFishingInputSchema="actor-v6" env.__NetoFishingInputMethod=modes[modeIndex].name end
         end
     elseif action=="Bite" then
         if autoOwned and stage~="idle" then
@@ -742,7 +1098,7 @@ end
 connect(fishing.OnClientEvent,onServer)
 connect(UIS.InputBegan,function(input,processed)
     if injecting>0 or (injectedInputs[input] and os.clock()-injectedInputs[input]<.2) then return end
-    if typeof(input)=="InputObject" then lastRealInput=input end
+    if isInputObject(input) then lastRealInput=input end
     if not enabled or processed or not autoOwned then return end
     if input.UserInputType~=Enum.UserInputType.Touch and input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
     manualAssisted=true report.manualTouches=report.manualTouches+1
@@ -752,6 +1108,12 @@ toggle=function(value)
     if value==nil then value=not enabled end
     release()
     enabled=value==true
+    if not enabled then stopActors(false)
+    elseif actorState.started and not actorState.ready and not actorState.scanning then
+        stopActors(true)
+        actorState.started=false actorState.candidates={} actorState.generation=actorState.generation+1
+        report.actors={status="retry",candidates={},errors={}}
+    end
     resetCycle(enabled and "Chegue perto do lago" or "OFF")
     inputUnavailableAt=nil nextModeScan=0
     if enabled then
@@ -769,10 +1131,15 @@ copy=function()
     report.ui={barVisible=shown,percent=n}
     local export={}
     for k,v in pairs(report) do export[k]=v end
+    if report.actors and report.dropDebug then
+        local actorExport={} for k,v in pairs(report.actors) do if k~="functionDiagnostic" then actorExport[k]=v end end
+        export.actors=actorExport
+    end
     local payload=Http:JSONEncode(export)
     if #payload>18000 and report.dropDebug then
         local d={} for k,v in pairs(report.dropDebug) do if k~="connection" then d[k]=v end end
         d.states=nil export.dropDebug=d export.trimmed=true export.events=nil
+        if d.actorFunctions then d.functions={} end
         payload=Http:JSONEncode(export)
         if #payload>18000 then
             local functions={}
@@ -804,6 +1171,17 @@ copy=function()
         end
         export.discovery=compact export.trimmed=true payload=Http:JSONEncode(export)
     end
+    if #payload>18000 and export.dropDebug and export.dropDebug.actorFunctions then
+        local original=export.dropDebug.actorFunctions
+        local compact={capabilities=original.capabilities,functions={}}
+        for _,fn in ipairs(original.functions or {}) do
+            local constants,upvalues={},{}
+            for i,value in ipairs(fn.constants or {}) do if i<=12 then constants[#constants+1]=value end end
+            for i,value in ipairs(fn.upvalues or {}) do if i<=2 then upvalues[#upvalues+1]=value end end
+            compact.functions[#compact.functions+1]={origin=fn.origin,source=fn.source,constants=constants,upvalues=upvalues}
+        end
+        export.dropDebug.actorFunctions=compact export.trimmed=true payload=Http:JSONEncode(export)
+    end
     env.FishingAutoTestReport=payload
     local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard
     local ok,result=false,nil
@@ -815,12 +1193,12 @@ end
 close=function()
     if not alive then return end
     if dropDebug and dropDebug.running then stopDropDebug(false) end
-    toggle(false) alive=false
+    toggle(false) stopActors(true) alive=false
     for _,c in ipairs(links) do c:Disconnect() end
     gui:Destroy()
 end
 env.FishingAutoTest={Toggle=toggle,Copy=copy,Close=close,Report=report,StartDropDebug=function() startDropDebug() end,StopDropDebug=function() stopDropDebug(true) end}
-connect(autoButton.Activated,function(input) if typeof(input)=="InputObject" then lastRealInput=input end toggle() end)
+connect(autoButton.Activated,function(input) if isInputObject(input) then lastRealInput=input end toggle() end)
 connect(copyButton.Activated,copy)
 connect(dropButton.Activated,function() if dropDebug and dropDebug.running then stopDropDebug(true) else startDropDebug() end end)
 connect(exit.Activated,close)
@@ -842,6 +1220,11 @@ local function step(dt)
     if tool~=lastRod then
         release() refreshModes() lastRod=tool
         inputUnavailableAt=nil nextModeScan=os.clock()+.5
+    end
+    if actorState.scanning then phase="Buscando funcoes da pesca nos Actors" return end
+    if actorRevision~=actorState.revision then
+        release() refreshModes() actorRevision=actorState.revision
+        if stage=="casting" then stage="idle" autoOwned=false nextCast=os.clock() end
     end
     if #modes==0 then
         inputUnavailableAt=inputUnavailableAt or os.clock()
