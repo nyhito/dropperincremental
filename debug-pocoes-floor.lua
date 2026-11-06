@@ -1,5 +1,5 @@
--- Dois scanners passivos e independentes: comando de puxar; barra/alvos/coleta.
--- Nao envia remotes, nao move pecas, nao altera a barra e nao simula entrada.
+-- DebrisMagnet: Auto Pull e dois experimentos independentes, todos desligados ao abrir.
+-- Sem clique de tela, TP, alteracao de progresso, forca ou movimento das pecas.
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
 local Run=game:GetService("RunService")
@@ -17,9 +17,13 @@ local reports={}
 local lifetime={}
 local own=setmetatable({}, {__mode="k"})
 local start,stop,copy,close
+local activeTick,releaseActive,onMagnetPacket,learnBegin,learnEnd
+local learned=nil
+local chunkCache={}
+local labels={hold="Detectar segurar",progress="Barra / alvos",auto="Auto Pull",early="Captura cedo",multi="Varios alvos"}
 local function word(value)
     local text=tostring(value or ""):lower()
-    for _,w in ipairs({"magnet","pull","chunk","blackhole","salvage","scrap","tractor"}) do if text:find(w,1,true) then return true end end
+    for _,w in ipairs({"debris","magnet","pull","chunk","blackhole","salvage","scrap","tractor"}) do if text:find(w,1,true) then return true end end
     return false
 end
 local function fieldWord(value)
@@ -88,7 +92,7 @@ local function event(s,kind,action,extra)
 end
 
 local gui=Instance.new("ScreenGui") gui.Name="NetoMagnetDebug" gui.ResetOnSpawn=false gui.DisplayOrder=10034 gui.Parent=pg
-local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(330,285) panel.Position=UDim2.new(0,10,.05,0)
+local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(330,335) panel.Position=UDim2.new(0,10,.05,0)
 panel.BackgroundColor3=Color3.fromRGB(21,23,30) panel.Parent=gui
 Instance.new("UICorner",panel).CornerRadius=UDim.new(0,8)
 local function button(text,x,y,width)
@@ -96,27 +100,32 @@ local function button(text,x,y,width)
     b.BackgroundColor3=Color3.fromRGB(66,49,110) b.Position=UDim2.fromOffset(x,y) b.Size=UDim2.fromOffset(width,34) b.Parent=panel
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,6) return b
 end
-local title=Instance.new("TextLabel") title.Text="MAGNET / DOIS DEBUGS" title.Font=Enum.Font.GothamBold title.TextSize=13
+local title=Instance.new("TextLabel") title.Text="DEBRIS MAGNET / TESTES" title.Font=Enum.Font.GothamBold title.TextSize=13
 title.TextColor3=Color3.new(1,1,1) title.BackgroundTransparency=1 title.Active=true title.Position=UDim2.fromOffset(10,0) title.Size=UDim2.fromOffset(225,36) title.Parent=panel
 local minimize=button("-",247,2,30) local exit=button("X",286,2,34)
-local holdButton=button("1 Segurar: iniciar",10,46,236) local holdCopy=button("Copiar",254,46,66)
-local progressButton=button("2 Barra / alvos: iniciar",10,91,236) local progressCopy=button("Copiar",254,91,66)
-local label=Instance.new("TextLabel") label.Text="Cada scanner copia apenas o proprio resultado ao parar.\n1: segure e solte a ferramenta.\n2: puxe itens leves/pesados, mude o alvo e colete."
+local buttons,copies={},{}
+for i,mode in ipairs({"auto","early","multi","hold","progress"}) do
+    buttons[mode]=button(labels[mode]..": iniciar",10,44+(i-1)*40,236)
+    copies[mode]=button("Copiar",254,44+(i-1)*40,66)
+end
+local label=Instance.new("TextLabel") label.Text="Teste Auto Pull primeiro, com o ima equipado e de frente para os itens. Cada teste copia so o seu resultado ao parar."
 label.TextWrapped=true label.TextXAlignment=Enum.TextXAlignment.Left label.TextYAlignment=Enum.TextYAlignment.Top
-label.Font=Enum.Font.Gotham label.TextSize=12 label.TextColor3=Color3.new(1,1,1) label.BackgroundTransparency=1 label.Position=UDim2.fromOffset(10,144) label.Size=UDim2.fromOffset(310,129) label.Parent=panel
+label.Font=Enum.Font.Gotham label.TextSize=12 label.TextColor3=Color3.new(1,1,1) label.BackgroundTransparency=1 label.Position=UDim2.fromOffset(10,248) label.Size=UDim2.fromOffset(310,75) label.Parent=panel
 local output=Instance.new("TextBox") output.MultiLine=true output.TextWrapped=true output.ClearTextOnFocus=false output.Text=""
 output.Font=Enum.Font.Code output.TextSize=10 output.BackgroundColor3=Color3.fromRGB(28,30,39) output.TextColor3=Color3.new(1,1,1)
-output.TextXAlignment=Enum.TextXAlignment.Left output.TextYAlignment=Enum.TextYAlignment.Top output.Position=UDim2.fromOffset(10,144) output.Size=UDim2.fromOffset(310,129) output.Visible=false output.Parent=panel
+output.TextXAlignment=Enum.TextXAlignment.Left output.TextYAlignment=Enum.TextYAlignment.Top output.Position=UDim2.fromOffset(10,248) output.Size=UDim2.fromOffset(310,75) output.Visible=false output.Parent=panel
 local mini=Instance.new("TextButton") mini.Text="MAG" mini.Font=Enum.Font.GothamBold mini.TextSize=12 mini.TextColor3=Color3.new(1,1,1)
 mini.BackgroundColor3=Color3.fromRGB(66,49,110) mini.Size=UDim2.fromOffset(60,34) mini.Position=panel.Position mini.Visible=false mini.Parent=gui
 local function updateButtons()
-    holdButton.Text=active and active.mode=="hold" and "1 Segurar: parar / copiar" or "1 Segurar: iniciar"
-    progressButton.Text=active and active.mode=="progress" and "2 Barra: parar / copiar" or "2 Barra / alvos: iniciar"
+    for mode,b in pairs(buttons) do b.Text=labels[mode]..(active and active.mode==mode and ": parar / copiar" or ": iniciar") end
 end
 
 -- Hook inerte fora das sessoes; nenhuma API de Instance ou JSON dentro dele.
 local probe=env.__NetoMagnetProbe
-if type(probe)~="table" then probe={version=1,installed=false,enabled=false} env.__NetoMagnetProbe=probe end
+if type(probe)~="table" or probe.version~=2 then
+    if type(probe)=="table" then probe.enabled=false end
+    probe={version=2,installed=false,enabled=false} env.__NetoMagnetProbe=probe
+end
 local function rawClone(v,depth,budget)
     budget.left=budget.left-1 if budget.left<0 then return "[limit]" end
     if type(v)~="table" then return v end
@@ -143,7 +152,7 @@ local function install()
                 if probe.tail-probe.head<192 then
                     local args=table.pack(...) local values={n=math.min(args.n,10),totalN=args.n} local budget={left=48}
                     for i=1,values.n do values[i]=rawClone(args[i],0,budget) end
-                    probe.tail=probe.tail+1 probe.queue[probe.tail]={kind="send",obj=self,method=method,args=values,at=os.clock()}
+                    probe.tail=probe.tail+1 probe.queue[probe.tail]={kind="send",obj=self,method=method,args=values,at=os.clock(),own=(probe.ownDepth or 0)>0}
                 else probe.dropped=probe.dropped+1 end
             end
         end
@@ -159,6 +168,8 @@ local noisy={DropperClick=true,BronzeDropperClick=true,MobAttackMlt=true,TreeHit
     Upgrade=true,Merchant=true,Fishing=true,TreasureHunting=true,TreasureWorld=true}
 local function attachRemote(s,obj)
     if s.remoteInfo[obj] or (not obj:IsA("RemoteEvent") and not obj:IsA("RemoteFunction")) then return end
+    if obj.Name~="DebrisMagnet" then return end
+    if obj:IsA("RemoteEvent") then s.remote=obj end
     local info={path=path(obj),class=obj.ClassName,related=word(obj.Name)}
     s.remoteInfo[obj]=info
     if noisy[obj.Name] and not info.related then return end
@@ -166,6 +177,7 @@ local function attachRemote(s,obj)
     if info.related and #s.report.remoteInventory<18 then s.report.remoteInventory[#s.report.remoteInventory+1]=info end
     if obj:IsA("RemoteEvent") then connect(obj.OnClientEvent,function(...)
         if not valid(s) then return end
+        if onMagnetPacket then onMagnetPacket(s,...) end
         local action=select(1,...)
         if info.related or probe.seen[obj] or os.clock()-(s.lastInput or -math.huge)<.45 or (type(action)=="string" and word(action)) then queuePacket(s,"receive",obj,"OnClientEvent",...) end
     end,s.links) end
@@ -176,6 +188,15 @@ local function drain(s,maximum)
         local row=probe.queue[probe.head] probe.queue[probe.head]=nil probe.head=probe.head+1 processed=processed+1
         local info=s.remoteInfo[row.obj]
         if info then
+            if row.kind=="send" and s.auto then
+                local action,id=row.args[1],row.args[2]
+                if type(id)=="number" then
+                    if action=="Start" then
+                        if not s.pulls[id] then s.pulls[id]={id=id,started=row.at,nextCatch=row.at+.15,fromGame=not row.own} end
+                        if not row.own then s.report.auto.gameStarts=s.report.auto.gameStarts+1 s.lastGameStart={id=id,at=row.at} end
+                    elseif action=="Stop" then s.pulls[id]=nil end
+                end
+            end
             local args={} for i=1,row.args.n do args[tostring(i)]=serial(row.args[i],0,{left=30}) end
             local action=""
             for i=1,math.min(row.args.n,3) do if type(row.args[i])=="string" then action=row.args[i]:sub(1,45) break end end
@@ -235,15 +256,17 @@ local function bindInput(s)
         local kind=input.UserInputType
         if kind~=Enum.UserInputType.Touch and kind~=Enum.UserInputType.MouseButton1 then return end
         s.lastInput=os.clock()
+        if s.auto then s.report.auto.manualTouches=s.report.auto.manualTouches+1 end
         local row={t=time(s),kind=tostring(kind),ended=false} s.holds[input]=row
         add(s.report.holds,row,16)
         event(s,"input","begin",{kind=tostring(kind)})
+        if learnBegin then learnBegin(s,input) end
     end,s.links)
     connect(UIS.InputEnded,function(input,processed)
         if not valid(s) then return end
         local row=s.holds[input]
         if not row and input.UserInputType==Enum.UserInputType.MouseButton1 then for key,item in pairs(s.holds) do if item.kind==tostring(input.UserInputType) then row=item s.holds[key]=nil break end end end
-        if row then row.ended=true row.endedAt=time(s) row.duration=row.endedAt-row.t row.endedProcessed=processed s.holds[input]=nil event(s,"input","end",{duration=row.duration}) end
+        if row then row.ended=true row.endedAt=time(s) row.duration=row.endedAt-row.t row.endedProcessed=processed s.holds[input]=nil event(s,"input","end",{duration=row.duration}) if learnEnd then learnEnd(s,input,row.duration) end end
     end,s.links)
 end
 
@@ -286,7 +309,9 @@ local function seedUi(s)
             if i%70==0 then task.wait(.02) end
         end
     end
-    if main then scan(main) end
+    local hud=main and main:FindFirstChild("DebrisHUD")
+    if hud then scan(hud) end
+    if main and #s.uiRefs<12 then scan(main) end
     if valid(s) and #s.uiRefs<10 then scan(pg) end
 end
 local function sampleUi(s)
@@ -319,6 +344,7 @@ end
 local function targetCandidate(s,obj,context)
     if s.mode~="progress" or s.targets[obj] or #s.report.targets>=8 or (not obj:IsA("BasePart") and not obj:IsA("Model")) then return end
     local name=obj.Name:lower()
+    if path(obj):find(".Crane.",1,true) then return end
     if name=="board" or name=="baseplate" or name=="platform" or name=="handle" then return end
     local attrs=obj:GetAttributes() local meaningful=false
     for key in pairs(attrs) do if fieldWord(key) or tostring(key):lower()=="id" then meaningful=true break end end
@@ -501,6 +527,276 @@ local function sampleLive(s)
     end
 end
 
+-- Somente referencias vivas de DebrisMagnet; nunca executa copia de script.
+local function getValues(fn)
+    local getup=(debug and debug.getupvalues) or env.getupvalues
+    if type(getup)~="function" then return nil end
+    local ok,values=pcall(getup,fn)
+    return ok and type(values)=="table" and values or nil
+end
+local function findStep(s)
+    local gc=getconnections or env.getconnections
+    local constants=(debug and debug.getconstants) or env.getconstants
+    if type(gc)~="function" or type(constants)~="function" then return end
+    local ok,list=pcall(gc,Run.RenderStepped)
+    if not ok or type(list)~="table" then return end
+    for i,c in ipairs(list) do
+        if i>120 then break end
+        local good,fn,foreign=pcall(function() return c.Function,c.ForeignState end)
+        if good and not foreign and type(fn)=="function" and not own[fn] then
+            local src=""
+            if type(getfenv)=="function" then pcall(function() local e=getfenv(fn) local x=rawget(e,"script") if typeof(x)=="Instance" then src=path(x) end end) end
+            if src:match("PlayerScripts%..*%.DebrisMagnet$") then
+                local read,values=pcall(constants,fn)
+                local marks={}
+                if read and type(values)=="table" then for _,v in pairs(values) do if type(v)=="string" then marks[v]=true end end end
+                if marks.GetMagnetStrength and marks.GetPullCount and marks.Progress then
+                    s.step={fn=fn,source=src}
+                    s.report.liveStep={source=src,verified=true}
+                    return
+                end
+            end
+        end
+    end
+end
+local function bools(s)
+    if not s.step then return nil end
+    local values=getValues(s.step.fn) if not values then return nil end
+    local out,n={},0
+    for k,v in next,values do
+        n=n+1 if n>80 then break end
+        if type(k)=="number" and type(v)=="boolean" then out[k]=v end
+    end
+    return out
+end
+learnBegin=function(s,input)
+    if s.mode~="hold" or s.learningHold or not s.step or not s.boolFrame then return end
+    local attempt={input=input,before=s.boolFrame,fn=s.step.fn}
+    s.learningHold=attempt
+    task.delay(.10,function()
+        if valid(s) and s.learningHold==attempt then attempt.during=bools(s) end
+    end)
+end
+learnEnd=function(s,input,duration)
+    local attempt=s.learningHold
+    if s.mode~="hold" or not attempt or attempt.input~=input then return end
+    s.learningHold=nil
+    task.delay(.08,function()
+        if not valid(s) or not s.step or s.step.fn~=attempt.fn or duration<.35 then return end
+        local after=bools(s) if not after or not attempt.during then return end
+        s.learnCycles=s.learnCycles+1
+        for index,before in pairs(attempt.before) do
+            if before==false and attempt.during[index]==true and after[index]==false then
+                s.learnScores[index]=(s.learnScores[index] or 0)+1
+            end
+        end
+        local candidates={}
+        for index,count in pairs(s.learnScores) do if count>=2 and count==s.learnCycles then candidates[#candidates+1]=index end end
+        s.report.learning={cycles=s.learnCycles,candidates=candidates,confirmed=#candidates==1,readOnly=true}
+        if #candidates==1 then
+            learned={fn=attempt.fn,index=candidates[1],source=s.step.source}
+            s.report.learning.index=candidates[1]
+        elseif #candidates>1 then learned=nil s.report.learning.reason="Mais de um estado acompanhou o toque; nenhuma escrita autorizada por deteccao." end
+    end)
+end
+local function nativeRelease(s)
+    if s.nativeTool then pcall(function() s.nativeTool:Deactivate() end) s.nativeTool=nil end
+    if s.bindingWritten and s.binding then
+        local setter=(debug and debug.setupvalue) or env.setupvalue
+        if type(setter)=="function" then
+            local ok=pcall(setter,s.binding.fn,s.binding.index,false)
+            s.report.auto.inputRestored=ok
+        end
+        s.bindingWritten=false
+    end
+end
+local function sendMagnet(s,action,id)
+    if not valid(s) or not s.remote then return false end
+    local a=s.report.auto
+    probe.ownDepth=(probe.ownDepth or 0)+1
+    local ok,err=pcall(function() s.remote:FireServer(action,id) end)
+    probe.ownDepth=math.max(0,(probe.ownDepth or 1)-1)
+    if ok then
+        a.sent[action]=(a.sent[action] or 0)+1
+        event(s,"request",action,{id=id})
+    else a.lastError=tostring(err):sub(1,160) end
+    return ok
+end
+releaseActive=function(s)
+    if not s.auto then return end
+    nativeRelease(s)
+    local ids={} for id in pairs(s.pulls) do ids[#ids+1]=id end
+    for _,id in ipairs(ids) do sendMagnet(s,"Stop",id) end
+    s.pulls={}
+    s.report.auto.phase="OFF"
+end
+onMagnetPacket=function(s,action,a,b,c)
+    local now=os.clock()
+    if action=="Spawn" and type(a)=="table" and type(a.Id)=="number" then
+        chunkCache[a.Id]={id=a.Id,data=a,seen=now,source="server_spawn"}
+        local count,oldest,at=0,nil,math.huge
+        for id,item in pairs(chunkCache) do count=count+1 if item.seen<at then oldest,at=id,item.seen end end
+        if count>256 then chunkCache[oldest]=nil end
+    elseif action=="Caught" and type(a)=="number" then
+        add(s.report.collectionEvidence,{t=time(s),kind="server_Caught",id=a,used=b,capacity=c},12)
+        if type(b)=="number" and type(c)=="number" then s.report.backpack={used=b,capacity=c,source="DebrisMagnet.Caught"} end
+        if s.auto and not s.caughtIds[a] then
+            s.caughtIds[a]=true
+            local r=s.report.auto local pull=s.pulls[a]
+            r.caughtWhileEnabled=r.caughtWhileEnabled+1
+            if pull then
+                r.controlledCaught=r.controlledCaught+1
+                if pull.lastCatch then r.caughtAfterTestRequest=r.caughtAfterTestRequest+1 end
+                add(r.catches,{id=a,t=time(s),seconds=now-pull.started,requestedEarly=pull.lastCatch~=nil,firstCatchAge=pull.firstCatchAge,source=pull.fromGame and "game_start" or "test_start"},12)
+            else r.unmatchedCaught=r.unmatchedCaught+1 end
+            s.pulls[a]=nil s.cooldowns[a]=now+60
+            if s.lastGameStart and s.lastGameStart.id==a then s.lastGameStart=nil end
+        end
+        chunkCache[a]=nil
+    elseif (action=="Despawn" or action=="Remove") and type(a)=="number" then
+        chunkCache[a]=nil s.pulls[a]=nil
+    end
+end
+local function rowPosition(row,depth)
+    if depth>2 then return nil end
+    local kind=typeof(row)
+    if kind=="Vector3" then return row end
+    if kind=="CFrame" then return row.Position end
+    if kind=="Instance" then return entityPosition(row) end
+    if type(row)~="table" then return nil end
+    for _,key in ipairs({"Position","CFrame","Part","Root","Visual","Model","Chunk","Object"}) do
+        local value=rawget(row,key)
+        if value~=nil and (type(value)=="table" or typeof(value)=="Instance" or typeof(value)=="Vector3" or typeof(value)=="CFrame") then
+            local p=rowPosition(value,depth+1) if p then return p end
+        end
+    end
+end
+local function readChunks(s)
+    if not s.step then return end
+    local values=getValues(s.step.fn) if not values then return end
+    local seen,remaining={},220
+    local function visit(row,key,depth)
+        if type(row)~="table" or typeof(row)~="table" or seen[row] or depth>3 or remaining<=0 then return end
+        seen[row]=true remaining=remaining-1
+        local data=rawget(row,"Data")
+        local id=rawget(row,"Id") or rawget(row,"ID") or rawget(row,"id") or (type(data)=="table" and rawget(data,"Id"))
+        if not id and type(key)=="number" and (chunkCache[key] or rawget(row,"Progress")~=nil or rawget(row,"Pulling")~=nil or typeof(rawget(row,"Model"))=="Instance") then id=key end
+        if type(id)=="number" and id==math.floor(id) and id>0 then
+            local item=chunkCache[id] or {id=id,seen=os.clock(),source="live_chunk"}
+            item.pos=rowPosition(row,0) or item.pos item.progress=rawget(row,"Progress") or rawget(row,"PullProgress")
+            item.pulling=rawget(row,"Pulling")==true item.liveAt=os.clock() item.source="live_chunk"
+            chunkCache[id]=item
+        end
+        local count=0
+        for k,v in next,row do count=count+1 if count>64 or remaining<=0 then break end
+            if type(v)=="table" and typeof(v)=="table" then visit(v,k,depth+1) end
+        end
+    end
+    for k,v in next,values do if remaining<=0 then break end visit(v,k,0) end
+    local report={}
+    for id,item in pairs(chunkCache) do
+        if #report<8 and item.liveAt and os.clock()-item.liveAt<1 then
+            report[#report+1]={id=id,position=item.pos and vector(item.pos),progress=serial(item.progress,0,{left=8}),pulling=item.pulling,source=item.source}
+        end
+    end
+    s.report.liveChunks=report
+end
+local function selectChunks(s,count)
+    local list={} local now=os.clock()
+    local origin=position() local camera=workspace.CurrentCamera
+    local look=camera and camera.CFrame and camera.CFrame.LookVector
+    for id,item in pairs(chunkCache) do
+        if not s.pulls[id] and now-(item.liveAt or item.seen)<20 and now>(s.cooldowns[id] or -1) then
+            local distance,dot=nil,nil
+            if item.pos and origin then
+                local d=item.pos-origin distance=d.Magnitude
+                if look and distance>.01 then dot=(d.X*look.X+d.Y*look.Y+d.Z*look.Z)/distance end
+            end
+            local gameTarget=s.lastGameStart and s.lastGameStart.id==id
+            local aimed=item.pulling or gameTarget or (distance and distance<250 and dot and dot>.35)
+            -- Varios: permite tambem IDs realmente recebidos em Spawn, apenas na area e com a ferramenta equipada.
+            if aimed or (s.mode=="multi" and item.data and s.inArea) then
+                list[#list+1]={id=id,score=(gameTarget and 1000 or 0)+(item.pulling and 500 or 0)+(dot or 0)*100-(distance or 200),source=aimed and "live_facing" or "server_spawn"}
+            end
+        end
+    end
+    table.sort(list,function(a,b) if a.score==b.score then return a.id<b.id end return a.score>b.score end)
+    local out={} for i=1,math.min(count,#list) do out[#out+1]=list[i] end return out
+end
+activeTick=function(s)
+    if not valid(s) then return end
+    local now=os.clock()
+    if not s.step and now>=(s.nextStepScan or 0) then s.nextStepScan=now+2 findStep(s) end
+    if s.mode=="hold" then if not s.learningHold then s.boolFrame=bools(s) end return end
+    if s.mode=="progress" then if now>=(s.nextChunks or 0) then s.nextChunks=now+.15 readChunks(s) end return end
+    local a=s.report.auto
+    local setter=(debug and debug.setupvalue) or env.setupvalue
+    a.canSetLearnedHold=type(setter)=="function"
+    local char=player.Character local tool=char and char:FindFirstChild("DebrisMagnet")
+    local front=pg:FindFirstChild("Front") local main=front and front:FindFirstChild("MainFrame") local hud=main and main:FindFirstChild("DebrisHUD")
+    s.inArea=hud and shown(hud) or false
+    local bag=s.report.backpack
+    if not tool or not tool:IsA("Tool") or not tool.Enabled or not s.inArea or (bag and bag.capacity>0 and bag.used>=bag.capacity) then
+        if s.nativeTool or s.bindingWritten or next(s.pulls) then releaseActive(s) end
+        a.phase=bag and bag.used>=bag.capacity and "Mochila cheia" or "Equipe DebrisMagnet na area do ima"
+        return
+    end
+    if s.nativeTool~=tool then
+        nativeRelease(s)
+        local ok,err=pcall(function() tool:Activate() end)
+        s.nativeTool=tool s.nativeAt=now a.nativeActivations=a.nativeActivations+1
+        a.nativeAvailable=ok if not ok then a.lastError=tostring(err):sub(1,160) end
+    end
+    if learned and s.step and learned.fn==s.step.fn then
+        s.binding=learned
+        local setter=(debug and debug.setupvalue) or env.setupvalue
+        local values=getValues(learned.fn)
+        if type(setter)=="function" and values and type(values[learned.index])=="boolean" then
+            if values[learned.index]~=true then
+                local ok,err=pcall(setter,learned.fn,learned.index,true)
+                if ok then s.bindingWritten=true a.learnedWrites=a.learnedWrites+1 else a.lastError=tostring(err):sub(1,160) end
+            end
+            a.inputMode="estado de segurar confirmado em dois testes"
+        elseif type(setter)~="function" then a.bindingUnavailable=true end
+    else a.inputMode="Tool:Activate / Deactivate" end
+    if s.mode=="auto" then
+        a.phase=next(s.pulls) and "Puxando pela ferramenta" or (now-s.nativeAt>3 and "Se nao puxar: Detectar segurar, segure/solte duas vezes" or "Ferramenta ativada; aponte para um item")
+        if a.bindingUnavailable and now-s.nativeAt>3 and not next(s.pulls) then a.phase="Executor sem escrita do segurar; pare e copie o resultado" end
+        return
+    end
+    if not s.remote then a.phase="DebrisMagnet remoto indisponivel" return end
+    if now>=(s.nextChunks or 0) then s.nextChunks=now+.15 readChunks(s) end
+    local count=0
+    for id,pull in pairs(s.pulls) do
+        if now-pull.started>9 then
+            sendMagnet(s,"Stop",id) s.pulls[id]=nil s.cooldowns[id]=now+2 a.timeouts=a.timeouts+1
+        else count=count+1 end
+    end
+    local limit=s.mode=="multi" and 3 or 1
+    if count<limit and now>=(s.nextStart or 0) then
+        local candidates=selectChunks(s,1)
+        local candidate=candidates[1]
+        if candidate then
+            local pull={id=candidate.id,started=now,nextCatch=now+.15,fromGame=false,selection=candidate.source}
+            s.pulls[candidate.id]=pull
+            if not sendMagnet(s,"Start",candidate.id) then s.pulls[candidate.id]=nil end
+            s.nextStart=now+.12 count=count+1
+        end
+    end
+    a.maxPending=math.max(a.maxPending,count)
+    -- No maximo uma requisicao Catch por tick, e 4/s por item; nao completa barra local.
+    if now>=(s.nextRequest or 0) then
+        local selected
+        for _,pull in pairs(s.pulls) do if now>=pull.nextCatch and (not selected or pull.nextCatch<selected.nextCatch) then selected=pull end end
+        if selected then
+            selected.nextCatch=now+.30 selected.lastCatch=now selected.firstCatchAge=selected.firstCatchAge or now-selected.started
+            sendMagnet(s,"Catch",selected.id) s.nextRequest=now+.06
+        end
+    end
+    a.pending=count
+    a.phase=count>0 and (s.mode=="multi" and "Testando ate 3 IDs; aguardando Caught" or "Testando Catch cedo; aguardando Caught") or "Aponte para um item para obter um alvo real"
+end
+
 copy=function(mode)
     mode=mode or (active and active.mode)
     local r=mode and reports[mode]
@@ -546,7 +842,8 @@ copy=function(mode)
                     local out,n={},0 for k,v in pairs(value) do n=n+1 if n>12 or remaining<=0 then break end out[type(k)=="string" and k:sub(1,40) or k]=compact(v,depth+1) end return out
                 end
                 export={format=r.format,mode=r.mode,placeId=r.placeId,seconds=export.seconds,running=export.running,trimmed=true,
-                    note="Resultado compacto; dados extras omitidos.",calls=compact(export.calls,0),holds=compact(export.holds,0),tools=compact(export.tools,0),collectionEvidence=compact(export.collectionEvidence,0)}
+                    note="Resultado compacto; dados extras omitidos.",auto=export.auto,learning=export.learning,liveChunks=export.liveChunks,
+                    calls=compact(export.calls,0),holds=compact(export.holds,0),tools=compact(export.tools,0),collectionEvidence=compact(export.collectionEvidence,0)}
                 payload=Http:JSONEncode(export) break
             end
         end
@@ -555,7 +852,8 @@ copy=function(mode)
     local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard local ok,value=false,nil
     if type(clip)=="function" then ok,value=pcall(clip,payload) end
     env.MagnetDebugReport=payload
-    if mode=="hold" then env.MagnetHoldReport=payload else env.MagnetProgressReport=payload end
+    env.MagnetReports=env.MagnetReports or {} env.MagnetReports[mode]=payload
+    if mode=="hold" then env.MagnetHoldReport=payload elseif mode=="progress" then env.MagnetProgressReport=payload end
     output.Text=payload output.Visible=not(ok and value~=false) label.Visible=not output.Visible
     if output.Visible then panel.Visible=true mini.Visible=false end
     return payload
@@ -563,6 +861,8 @@ end
 stop=function(mode,shouldCopy)
     local s=active
     if not s or (mode and mode~=s.mode) then if shouldCopy~=false and mode then return copy(mode) end return end
+    drain(s,192)
+    if releaseActive then releaseActive(s) end
     probe.enabled=false
     drain(s,192)
     local ok,message=pcall(function() sampleUi(s) if s.mode=="progress" then sampleTargets(s) end end)
@@ -573,17 +873,20 @@ stop=function(mode,shouldCopy)
     s.running=false active=nil probe.allowed={}
     disconnect(s.links)
     updateButtons()
-    label.Text=(s.mode=="hold" and "Segurar" or "Barra / alvos")..": parado. Resultado separado pronto."
+    label.Text=labels[s.mode]..": parado. Resultado separado pronto."
     if shouldCopy~=false then return copy(s.mode) end
 end
 start=function(mode)
-    if not alive or (mode~="hold" and mode~="progress") then return end
+    if not alive or not labels[mode] then return end
     if active and active.mode==mode then return end
     if active then stop(active.mode,true) end
-    local s={mode=mode,started=os.clock(),running=true,links={},groups={},remoteInfo={},tools={},characters={},holds={},uiRefs={},uiSeen={},uiProbe={},pendingTexts={},textCursor=1,targets={},live={}}
-    s.report={format="magnet-debug-v1",mode=mode,running=true,placeId=game.PlaceId,note="Observacao passiva: nao envia comandos, nao altera barra, velocidade ou pecas. Desaparecer/mover pecas nao comprova coleta. Copia somente este scanner; nao identifica autoria de chamadas de outros scripts.",
+    local s={mode=mode,started=os.clock(),running=true,links={},groups={},remoteInfo={},tools={},characters={},holds={},uiRefs={},uiSeen={},uiProbe={},pendingTexts={},textCursor=1,targets={},live={},
+        auto=mode=="auto" or mode=="early" or mode=="multi",pulls={},caughtIds={},cooldowns={},learnScores={},learnCycles=0}
+    s.report={format="magnet-tests-v2",mode=mode,running=true,placeId=game.PlaceId,note="Sem clique de tela, TP ou alteracao de progresso/forca/pecas. Auto Pull ativa a ferramenta; Captura cedo e Varios alvos enviam Start/Catch/Stop experimentais. So Caught confirma coleta. Caught enquanto ligado nao exclui ajuda manual. Cada botao tem resultado separado.",
         calls={},remoteInventory={},events={},holds={},tools={},ui={},targets={},world={},collectionEvidence={},dropped=0,droppedGroups=0,
         logic={status="scanning",scripts={},signals={},functions={},states={}}}
+    if s.auto then s.report.auto={phase="Iniciando",sent={Start=0,Stop=0,Catch=0},gameStarts=0,nativeActivations=0,learnedWrites=0,
+        caughtWhileEnabled=0,controlledCaught=0,caughtAfterTestRequest=0,unmatchedCaught=0,catches={},timeouts=0,maxPending=0,manualTouches=0} end
     active=s reports[mode]=s.report
     probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.allowed={} probe.seen={}
     local remotes=RS:FindFirstChild("Remotes")
@@ -592,6 +895,12 @@ start=function(mode)
     bindCharacter(s,player.Character)
     connect(player.CharacterAdded,function(c) if valid(s) then bindCharacter(s,c) end end,s.links)
     bindInput(s)
+    findStep(s)
+    connect(Run.RenderStepped,function()
+        if not valid(s) or s.failed then return end
+        local ok,message=pcall(function() drain(s,24) activeTick(s) end)
+        if not ok then s.failed=true s.report.controlError=tostring(message):sub(1,180) if s.auto then releaseActive(s) s.report.auto.phase="Falha no controle; pare e copie o resultado" end end
+    end,s.links)
     connect(pg.DescendantAdded,function(obj)
         if valid(s) and obj:IsA("GuiObject") and not obj:IsDescendantOf(gui) then
             if isText(obj) and #s.pendingTexts<600 then s.pendingTexts[#s.pendingTexts+1]=obj end inspectUi(s,obj)
@@ -616,7 +925,12 @@ start=function(mode)
             if s.mode=="progress" then sampleTargets(s) end
             end)
             if not ok then s.report.readError=tostring(message):sub(1,180) end
-            label.Text=(s.mode=="hold" and "SEGURAR" or "BARRA / ALVOS").." gravando: "..math.floor(time(s)).." s\n"..(s.mode=="hold" and "Segure 3 s, solte, segure de novo. Pare neste botao para copiar somente Segurar." or "Puxe itens leves e pesados; troque o alvo. Pare neste botao para copiar somente Barra / alvos.")
+            if s.auto then
+                local a=s.report.auto
+                label.Text=labels[s.mode].." | "..a.phase.."\nCaught: "..a.caughtWhileEnabled.." | Catch pedidos: "..a.sent.Catch.."\nPare no mesmo botao para copiar este teste."
+            elseif s.mode=="hold" then
+                label.Text="Segure 1 s, solte 1 s; repita duas vezes.\n"..(s.report.learning and s.report.learning.confirmed and "Segurar identificado. Agora teste Auto Pull." or "Detectando o estado real, sem alterar nada.")
+            else label.Text="BARRA / ALVOS: "..math.floor(time(s)).." s\nPuxe itens leves/pesados. Pare para copiar so este scanner." end
             task.wait(.15)
         end
     end)
@@ -627,10 +941,11 @@ close=function()
     alive=false probe.enabled=false disconnect(lifetime) gui:Destroy()
 end
 env.MagnetDebug={Start=start,Stop=stop,Copy=copy,Close=close,GetReport=function(mode) return reports[mode] end,GetActive=function() return active and active.mode end}
-connect(holdButton.Activated,function() if active and active.mode=="hold" then stop("hold",true) else start("hold") end end,lifetime)
-connect(progressButton.Activated,function() if active and active.mode=="progress" then stop("progress",true) else start("progress") end end,lifetime)
-connect(holdCopy.Activated,function() copy("hold") end,lifetime)
-connect(progressCopy.Activated,function() copy("progress") end,lifetime)
+for mode,b in pairs(buttons) do
+    local selected=mode
+    connect(b.Activated,function() if active and active.mode==selected then stop(selected,true) else start(selected) end end,lifetime)
+    connect(copies[selected].Activated,function() copy(selected) end,lifetime)
+end
 connect(exit.Activated,close,lifetime)
 connect(minimize.Activated,function() mini.Position=panel.Position panel.Visible=false mini.Visible=true end,lifetime)
 connect(mini.Activated,function() panel.Position=mini.Position panel.Visible=true mini.Visible=false end,lifetime)
@@ -643,7 +958,7 @@ end,lifetime)
 connect(UIS.InputChanged,function(input)
     if dragging and ((dragInput and input==dragInput) or (not dragInput and input.UserInputType==Enum.UserInputType.MouseMovement)) then
         local delta=input.Position-inputStart local view=workspace.CurrentCamera.ViewportSize
-        panel.Position=UDim2.fromOffset(math.clamp(panelStart.X.Offset+delta.X,0,math.max(0,view.X-330)),math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-285)))
+        panel.Position=UDim2.fromOffset(math.clamp(panelStart.X.Offset+delta.X,0,math.max(0,view.X-330)),math.clamp(panelStart.Y.Scale*view.Y+panelStart.Y.Offset+delta.Y,0,math.max(0,view.Y-335)))
     end
 end,lifetime)
 connect(UIS.InputEnded,function(input) if input==dragInput or input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end,lifetime)
