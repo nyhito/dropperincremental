@@ -1,4 +1,4 @@
--- Auto Scrap PC / debug. Mouse segurado; a rotina original puxa e coleta.
+-- Auto Scrap PC v2 / debug. Segura, acompanha dentro do alvo e entrega.
 -- Base 61,3,-432 / entrega 128,3,-407. Sem alterar forca, barra ou pecas.
 local Players=game:GetService("Players")
 local Run=game:GetService("RunService")
@@ -18,7 +18,8 @@ end
 local BASE,SELL=Vector3.new(61,3,-432),Vector3.new(128,3,-407)
 local pg=player:WaitForChild("PlayerGui")
 local alive,active,lastReport=true,nil,nil
-local start,stop,copy,close,paint
+local start,stop,copy,close,paint,setFrozen
+local preferences={gold=false,void=false}
 local lifetime={}
 local restoreGeneration=0
 local mobileToken={} env.__NetoScrapMobileToken=mobileToken
@@ -53,7 +54,7 @@ local function hud(s)
     s.report.ui=u return u
 end
 local gui=Instance.new("ScreenGui") gui.Name="NetoScrapPCDebug" gui.ResetOnSpawn=false gui.IgnoreGuiInset=true gui.DisplayOrder=10040 gui.Parent=pg
-local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(302,206) panel.Position=UDim2.fromOffset(12,62)
+local panel=Instance.new("Frame") panel.Size=UDim2.fromOffset(302,250) panel.Position=UDim2.fromOffset(12,62)
 panel.BackgroundColor3=Color3.fromRGB(20,23,31) panel.Parent=gui
 Instance.new("UICorner",panel).CornerRadius=UDim.new(0,9)
 local function button(text,x,y,w)
@@ -65,9 +66,10 @@ local title=Instance.new("TextLabel") title.Text="AUTO SCRAP • PC" title.Font=
 title.TextColor3=Color3.new(1,1,1) title.BackgroundTransparency=1 title.Size=UDim2.fromOffset(207,34) title.Parent=panel
 local miniButton=button("−",217,1,34) local exitButton=button("X",257,1,34)
 local toggleButton=button("Auto Scrap: OFF",10,40,282) local copyButton=button("Parar e copiar debug",10,79,282)
+local goldButton=button("Ouro: OFF",10,118,137) local voidButton=button("Vazio: OFF",155,118,137)
 local status=Instance.new("TextLabel") status.BackgroundTransparency=1 status.TextColor3=Color3.new(1,1,1)
 status.TextSize=12 status.Font=Enum.Font.Gotham status.TextWrapped=true status.TextXAlignment=Enum.TextXAlignment.Left status.TextYAlignment=Enum.TextYAlignment.Top
-status.Position=UDim2.fromOffset(10,121) status.Size=UDim2.fromOffset(282,77) status.Text="Equipe o imã e ative.\nEntrega e retorno automáticos." status.Parent=panel
+status.Position=UDim2.fromOffset(10,159) status.Size=UDim2.fromOffset(282,83) status.Text="Segue dentro do alvo e entrega ao encher.\nVazio > Ouro > normal. Inicia em 3 segundos.\nAbrir esta janela desliga o farm." status.Parent=panel
 local mini=Instance.new("TextButton") mini.Text="SCRAP" mini.Font=Enum.Font.GothamBold mini.TextSize=12 mini.TextColor3=Color3.new(1,1,1)
 mini.BackgroundColor3=Color3.fromRGB(53,73,124) mini.Size=UDim2.fromOffset(78,36) mini.Position=panel.Position mini.Visible=false mini.Parent=gui
 local function freePoint(x,y)
@@ -249,17 +251,29 @@ local function scanStep(s)
     end
 end
 local function liveObjects(s)
-    s.objects={} if not s.step and os.clock()>=(s.nextStep or 0) then s.nextStep=os.clock()+2 scanStep(s) end
+    s.objects={} s.rows={} if not s.step and os.clock()>=(s.nextStep or 0) then s.nextStep=os.clock()+2 scanStep(s) end
     if not s.step then return end
     local ok,up=pcall(getup,s.step) if not ok or type(up)~="table" then return end
     for _,map in pairs(up) do
         if type(map)=="table" then
+            local catalog=rawget(map,"Mutations")
+            if type(catalog)=="table" then for key,entry in pairs(catalog) do
+                if type(entry)=="table" then
+                    local name=tostring(rawget(entry,"Name") or rawget(entry,"Label") or key):lower()
+                    local label=(name=="gold" or name=="golden" or name=="ouro") and "Ouro" or (name=="void" or name=="vazio") and "Vazio"
+                    if label then
+                        local code=rawget(entry,"Id") or rawget(entry,"Index") or (type(key)=="number" and key)
+                        if code~=nil then s.mutationCodes[code]=label end
+                        local phase=rawget(entry,"Phase") if phase~=nil then s.phaseCodes[phase]=label end
+                    end
+                end
+            end end
             local inspected=0
             for key,row in pairs(map) do
                 inspected=inspected+1 if inspected>160 then break end
                 if type(row)=="table" then
                     local id=rawget(row,"Id") or (type(key)=="number" and key)
-                    local obj=id and chunkObject(row) if obj then s.objects[id]=obj end
+                    local obj=id and chunkObject(row) if obj then s.objects[id]=obj s.rows[id]=row end
                 end
             end
         end
@@ -285,37 +299,155 @@ local function lockedOutline()
         end
     end return best
 end
-local function setTarget(s,obj,id,source)
+local function mutationLabel(value)
+    if type(value)~="string" then return nil end
+    local normalized=value:lower():gsub("<[^>]*>","")
+    for word in normalized:gmatch("[%a]+") do
+        if word=="void" or word=="voided" or word=="vazio" then return "Vazio" end
+    end
+    for word in normalized:gmatch("[%a]+") do
+        if word=="gold" or word=="golden" or word=="ouro" then return "Ouro" end
+    end
+end
+local function textureKey(value)
+    if type(value)~="string" or value=="" then return nil end
+    return value:match("(%d+)%D*$") or value
+end
+local function mutationData(s,data)
+    if type(data)~="table" then return nil end
+    for _,key in ipairs({"Mutation","MutationName","Variant","VariantName","Quality","Finish","Trait"}) do
+        local value=rawget(data,key) local label=mutationLabel(value)
+        if not label and type(value)=="table" then
+            for _,name in ipairs({"Name","Label","Title","Id"}) do label=label or mutationLabel(rawget(value,name)) end
+        end
+        if not label and type(value)=="number" then label=s.mutationCodes[value] end
+        if label then return label,"metadata:"..key end
+    end
+    if rawget(data,"IsVoid")==true or rawget(data,"Vazio")==true then return "Vazio","metadata:flag" end
+    if rawget(data,"IsGold")==true or rawget(data,"Gold")==true or rawget(data,"Ouro")==true then return "Ouro","metadata:flag" end
+    local phase=rawget(data,"Phase")
+    if phase~=nil and s.phaseCodes[phase] then return s.phaseCodes[phase],"metadata:configured_Phase" end
+end
+local function mutation(s,obj,id)
+    local label,source=mutationData(s,s.rows[id])
+    if not label then label,source=mutationData(s,s.spawn[id]) end
+    local rootAttrs=obj:GetAttributes()
+    if not label then label,source=mutationData(s,rootAttrs) end
+    if label then return label,source end
+    -- GoldTexture/VoidTexture existem em todos os itens: compara a textura ATIVA.
+    local pieces={obj} local descendants=obj:GetDescendants()
+    for i=1,math.min(#descendants,60) do pieces[#pieces+1]=descendants[i] end
+    local baseMatched=false
+    for _,piece in ipairs(pieces) do
+        local attrs=piece:GetAttributes()
+        label,source=mutationData(s,attrs) if label then return label,source end
+        if piece:IsA("TextLabel") or piece:IsA("TextButton") then
+            label=mutationLabel(piece.Text) if label then return label,"world_label" end
+        end
+        local current
+        pcall(function()
+            if piece:IsA("MeshPart") then current=piece.TextureID
+            elseif piece:IsA("SurfaceAppearance") then current=piece.ColorMap
+            elseif piece:IsA("Decal") or piece:IsA("Texture") then current=piece.Texture end
+        end)
+        current=textureKey(current)
+        if current then
+            local parents=piece.Parent and piece.Parent:GetAttributes() or {}
+            for _,a in ipairs({attrs,parents,rootAttrs}) do
+                if current==textureKey(a.VoidTexture) then return "Vazio","active_texture" end
+                if current==textureKey(a.GoldTexture) then return "Ouro","active_texture" end
+                if current==textureKey(a.BaseTexture) then baseMatched=true end
+            end
+        end
+    end
+    return mutationLabel(obj.Name) or (baseMatched and "Normal" or "Desconhecido"),baseMatched and "base_texture" or "name_or_unknown"
+end
+local function priority(label)
+    if preferences.void and label=="Vazio" then return 2 end
+    if preferences.gold and label=="Ouro" then return 1 end
+    return 0
+end
+local function setTarget(s,obj,id,source,classification,evidence)
     if obj==s.target and id==s.targetId then return end
+    local previous=s.target
     s.target=obj s.targetId=id s.targetAt=os.clock() s.lastProgress=os.clock() s.lastFraction=0
-    s.report.target=obj and {path=path(obj),id=id,source=source} or nil
-    if obj then event(s,"target",s.report.target) end
+    s.targetMutation=classification or "Desconhecido" s.targetPriority=priority(s.targetMutation)
+    if obj then
+        local position=objectPosition(obj)
+        local from=s.root and s.root.Position or BASE
+        local flat=Vector3.new(position.X-from.X,0,position.Z-from.Z)
+        s.approach=flat.Magnitude>.1 and flat.Unit or s.approach or Vector3.new(0,0,-1)
+        s.report.targetSwitches=s.report.targetSwitches+1
+    end
+    s.report.target=obj and {path=path(obj),id=id,source=source,mutation=s.targetMutation,mutationEvidence=evidence,priority=s.targetPriority} or nil
+    if obj then event(s,previous and "target_switch" or "target",s.report.target) end
 end
 local function chooseTarget(s,u)
     local now=os.clock()
-    if s.target and (not objectPosition(s.target) or not inField(s.target)) then setTarget(s,nil) end
+    if s.target and (not objectPosition(s.target) or not inField(s.target) or s.completed[s.targetId] or s.doneObjects[s.target]) then setTarget(s,nil) end
     if now>=(s.nextTargets or 0) then
-        s.nextTargets=now+.16 liveObjects(s)
-        local outline=lockedOutline()
-        local lockedId if outline then for id,obj in pairs(s.objects) do if obj==outline or outline:IsDescendantOf(obj) then lockedId=id break end end end
-        if outline and not s.cooldown[outline] then setTarget(s,outline,lockedId,"blue_outline") end
-        if not outline then
-            local latest,at
-            for id,t in pairs(s.pulling) do if s.objects[id] and (not at or t>at) then latest,at=id,t end end
-            if latest and (not s.targetId or not s.pulling[s.targetId]) then setTarget(s,s.objects[latest],latest,"game_Start") end
+        s.nextTargets=now+.12 liveObjects(s)
+        local candidates,seen={},{}
+        local function candidate(obj,id)
+            if not obj or seen[obj] or s.completed[id] or s.doneObjects[obj] or not inField(obj) then return end
+            local p=objectPosition(obj) if not p then return end seen[obj]=true
+            local label,evidence=mutation(s,obj,id)
+            if s.classSeen[obj]~=label then
+                s.classSeen[obj]=label
+                local attrs=obj:GetAttributes() local spawn=s.spawn[id] or {} local row=s.rows[id] or {}
+                local sample={id=id,name=obj.Name,classification=label,evidence=evidence}
+                for _,name in ipairs({"Mutation","Variant","Phase","IsVoid","IsGold","BaseTexture","GoldTexture","VoidTexture"}) do
+                    local v=attrs[name] if v==nil then v=spawn[name] end if v==nil then v=row[name] end
+                    if type(v)=="string" or type(v)=="number" or type(v)=="boolean" then sample[name]=v end
+                end
+                pcall(function() if obj:IsA("MeshPart") then sample.activeTexture=obj.TextureID end end)
+                add(s.report.mutationSamples,sample,12)
+            end
+            if s.target==obj and id and not s.targetId then s.targetId=id s.report.target.id=id end
+            if s.cooldown[obj] and s.cooldown[obj]>now then return end
+            candidates[#candidates+1]={obj=obj,id=id,label=label,evidence=evidence,rank=priority(label),distance=(p-(s.root and s.root.Position or BASE)).Magnitude}
         end
-        if not s.target then
-            local field=workspace:FindFirstChild("DebrisField") local best,bestD
-            if field then for _,obj in ipairs(field:GetChildren()) do
-                local p=objectPosition(obj) local d=p and (p-BASE).Magnitude
-                if d and d<180 and (not s.cooldown[obj] or s.cooldown[obj]<now) and (not bestD or d<bestD) then best,bestD=obj,d end
+        for id,obj in pairs(s.objects) do candidate(obj,id) end
+        local field=workspace:FindFirstChild("DebrisField")
+        if field then for _,obj in ipairs(field:GetChildren()) do candidate(obj,nil) end end
+        if s.target then
+            s.targetMutation=mutation(s,s.target,s.targetId) s.targetPriority=priority(s.targetMutation)
+            s.report.target.mutation=s.targetMutation s.report.target.priority=s.targetPriority
+        end
+        local best
+        for _,c in ipairs(candidates) do
+            if c.rank>0 and (not best or c.rank>best.rank or c.rank==best.rank and c.distance<best.distance) then best=c end
+        end
+        -- Mesma categoria nunca interrompe. Vazio interrompe Ouro/normal; Ouro interrompe normal.
+        if best and (not s.target or best.rank>s.targetPriority) then
+            if s.target then s.report.priorityPreemptions=s.report.priorityPreemptions+1 end
+            setTarget(s,best.obj,best.id,"mutation_priority",best.label,best.evidence)
+        elseif not s.target then
+            -- Dos dois itens em puxada, permanece no primeiro ate Caught.
+            local selected,first
+            for _,c in ipairs(candidates) do
+                local began=c.id and s.pulling[c.id]
+                if began and (not first or began<first) then selected,first=c,began end
+            end
+            if not selected then
+                local outline=lockedOutline()
+                for _,c in ipairs(candidates) do if c.obj==outline or outline and outline:IsDescendantOf(c.obj) then selected=c break end end
+            end
+            if not selected then for _,c in ipairs(candidates) do
+                if c.distance<200 and (not selected or c.distance<selected.distance) then selected=c end
             end end
-            if best then setTarget(s,best,nil,"nearest_fallback") end
+            if selected then setTarget(s,selected.obj,selected.id,first and "first_game_Start" or "outline_or_nearest",selected.label,selected.evidence) end
         end
+        local unknown=0 local gold,void=0,0
+        for _,c in ipairs(candidates) do
+            if c.label=="Desconhecido" then unknown=unknown+1 elseif c.label=="Ouro" then gold=gold+1 elseif c.label=="Vazio" then void=void+1 end
+        end
+        s.report.available={ouro=gold,vazio=void,unclassified=unknown}
     end
     if u.progress>s.lastFraction+.004 then s.lastProgress=now end s.lastFraction=u.progress
-    if s.target and now-(s.lastProgress or now)>3 and u.progress<.01 then
-        s.cooldown[s.target]=now+4 event(s,"target_no_progress",s.report.target) setTarget(s,nil)
+    -- Um alvo sem qualquer progresso pode ter requisito nao atendido; tenta o proximo.
+    if s.target and now-(s.lastProgress or now)>8 and u.progress<.01 then
+        s.cooldown[s.target]=now+5 event(s,"target_no_progress",s.report.target) setTarget(s,nil)
     end
     for obj,t in pairs(s.cooldown) do if t<now then s.cooldown[obj]=nil end end
     return s.target and objectPosition(s.target)
@@ -351,11 +483,30 @@ local function drain(s)
         if a=="Start" or a=="Stop" or a=="Catch" then event(s,"game_"..a,{id=id}) end
     end
 end
+setFrozen=function(s,value)
+    if not s.root then return end
+    if value then
+        if not s.frozen then
+            s.frozen=true s.savedCollisions={}
+            for _,part in ipairs(s.char:GetDescendants()) do if part:IsA("BasePart") then s.savedCollisions[part]=part.CanCollide end end
+            event(s,"freeze_inside")
+        end
+        s.root.Anchored=true
+        for part in pairs(s.savedCollisions) do if part.Parent then part.CanCollide=false end end
+        s.root.AssemblyLinearVelocity=Vector3.new(0,0,0) s.root.AssemblyAngularVelocity=Vector3.new(0,0,0)
+    elseif s.frozen then
+        s.root.Anchored=s.originalAnchored
+        for part,value in pairs(s.savedCollisions or {}) do if part.Parent then part.CanCollide=value end end
+        s.savedCollisions={} s.frozen=false event(s,"unfreeze")
+    end
+    s.report.frozen=s.frozen==true
+end
 local function saveCharacter(s,char,root,hum)
     if s.char==char then return end
     if s.hum and s.hum.Parent then pcall(function() s.hum.AutoRotate=s.autoRotate end) end
-    if s.char then release(s) event(s,"respawn") end
+    if s.char then setFrozen(s,false) release(s) event(s,"respawn") end
     s.char=char s.root=root s.hum=hum s.autoRotate=hum.AutoRotate s.report.recoveries=s.report.recoveries+(s.hadChar and 1 or 0) s.hadChar=true
+    s.originalAnchored=root.Anchored
     hum.AutoRotate=false s.atBase=false s.pulling={} setTarget(s,nil)
 end
 local function teleport(s,position,label)
@@ -383,6 +534,7 @@ local function aim(s,point,anchor)
 end
 local function tick(s)
     if not valid(s) then return end drain(s)
+    if os.clock()<s.activateAt then s.report.phase="Inicia em "..math.ceil(s.activateAt-os.clock()).."s • feche a interface" return end
     local char=player.Character local root=char and char:FindFirstChild("HumanoidRootPart") local hum=char and char:FindFirstChildOfClass("Humanoid")
     if not root or not hum or hum.Health<=0 then release(s) s.report.phase="Aguardando personagem" return end
     saveCharacter(s,char,root,hum)
@@ -391,6 +543,7 @@ local function tick(s)
     local u=hud(s) local now=os.clock()
     local full=(u.used and u.capacity and u.capacity>0 and u.used>=u.capacity) or (u.visible and u.note:lower():find("backpack full",1,true)~=nil)
     if full and s.stage~="selling" then
+        setFrozen(s,false)
         s.stage="selling" s.sellAt=now s.sellStart=u.used s.saleCheck=now+.4 s.saleRetry=now+5
         s.report.trips=s.report.trips+1 setTarget(s,nil) s.pulling={} teleport(s,SELL,"TP_entrega")
     end
@@ -413,14 +566,25 @@ local function tick(s)
     end
     if not tool.Enabled then release(s) s.report.phase="Imã indisponível" return end
     if not u.visible then release(s) s.report.phase="Aguardando área do imã" return end
-    local target=chooseTarget(s,u) or (BASE+Vector3.new(0,3,-30))
-    if (root.Position-BASE).Magnitude>.6 then root.AssemblyLinearVelocity=Vector3.new(0,0,0) end
-    if aim(s,target,BASE) then
-        if pointer(s) then s.report.phase=s.target and "Puxando • mouse segurado" or "Procurando alvo • mouse segurado" end
+    local target=chooseTarget(s,u)
+    local anchor=BASE
+    if target then
+        -- Pequeno deslocamento interno evita direcao de comprimento zero no jogo.
+        anchor=target-(s.approach or Vector3.new(0,0,-1))*.12
+        setFrozen(s,true) s.report.followFrames=s.report.followFrames+1
+        s.report.followPosition=vec(anchor)
+    else setFrozen(s,false) target=BASE+Vector3.new(0,3,-30) end
+    if (root.Position-anchor).Magnitude>.6 then root.AssemblyLinearVelocity=Vector3.new(0,0,0) end
+    if aim(s,target,anchor) then
+        if pointer(s) then s.report.phase=s.target and "Dentro do alvo • segurando • "..s.targetMutation or "Procurando alvo • mouse segurado" end
     else release(s) s.report.phase="Aguardando ponto livre" end
 end
 local function cleanup(s)
     probe.enabled=false probe.queue={} disconnect(s.listeners) release(s)
+    if s.root and s.root.Parent then
+        pcall(function() teleport(s,BASE,"TP_base_OFF") s.report.returnedToBase=true end)
+    end
+    pcall(setFrozen,s,false)
     if s.hum and s.hum.Parent then pcall(function() s.hum.AutoRotate=s.autoRotate end) end
     if s.root and s.root.Parent then pcall(function() s.root.AssemblyAngularVelocity=Vector3.new(0,0,0) end) end
     if s.camera and s.cameraSaved then pcall(function()
@@ -444,23 +608,33 @@ copy=function()
 end
 paint=function()
     local s=active local r=s and s.report or lastReport if not r then return end local u=r.ui or {}
-    status.Text=string.format("%s\nMochila: %s / %s • Caught: %d\nEntregas confirmadas: %d • %s",r.phase,tostring(u.used or "?"),tostring(u.capacity or "?"),r.caught,r.deposits,r.backend or "sem entrada")
+    status.Text=string.format("%s\nMochila: %s / %s • Caught: %d\nEntregas: %d • Vazio > Ouro > normal",r.phase,tostring(u.used or "?"),tostring(u.capacity or "?"),r.caught,r.deposits)
     mini.Text=s and ("SCRAP "..tostring(u.used or "?")) or "SCRAP OFF"
 end
-start=function()
+start=function(delay)
     if not alive or active then return end restoreGeneration=restoreGeneration+1
     local remotes=RS:FindFirstChild("Remotes") local remote=remotes and remotes:FindFirstChild("DebrisMagnet")
     if not remote or not remote:IsA("RemoteEvent") then status.Text="Remote DebrisMagnet indisponível." return end
-    local s={running=true,started=os.clock(),listeners={},remote=remote,stage="farming",objects={},pulling={},cooldown={},held=false,lastFraction=0,mouseBehavior=UIS.MouseBehavior,mouseIcon=UIS.MouseIconEnabled}
-    s.report={format="scrap-pc-hold-v1",note="Mouse PC segurado. Mira segue o alvo; rotina original puxa/coleta. Entrega exige mochila zerada. Caught nao distingue ajuda de outros scripts.",placeId=game.PlaceId,running=true,phase="Iniciando",base=vec(BASE),sale=vec(SELL),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0}
+    local s={running=true,started=os.clock(),activateAt=os.clock()+math.max(0,tonumber(delay) or 3),listeners={},remote=remote,stage="farming",objects={},rows={},spawn={},spawnOrder={},mutationCodes={},phaseCodes={},completed={},doneObjects=setmetatable({},{__mode="k"}),classSeen=setmetatable({},{__mode="k"}),pulling={},cooldown={},held=false,lastFraction=0,mouseBehavior=UIS.MouseBehavior,mouseIcon=UIS.MouseIconEnabled}
+    s.report={format="scrap-pc-hold-v2-inside-priority",note="Mouse PC mantido; segue congelado dentro do primeiro alvo. Vazio > Ouro > normal quando selecionados. Nome/textura ativa identificam a mutacao; Phase nao e presumido. Entrega aguarda mochila zerada. Abrir GUI desliga; OFF retorna a base e restaura mobile.",placeId=game.PlaceId,running=true,phase="Iniciando em 3s",base=vec(BASE),sale=vec(SELL),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},mutationSamples={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0,targetSwitches=0,priorityPreemptions=0,followFrames=0,preferences={ouro=preferences.gold,vazio=preferences.void}}
     active=s lastReport=s.report
     local ok,err=pcall(function()
         installProbe(s)
         connect(remote.OnClientEvent,function(action,id,used,cap)
             if not valid(s) then return end
-            if action=="Caught" then
+            if action=="Spawn" and type(id)=="table" then
+                local data=id if data.Id~=nil then
+                    if not s.spawn[data.Id] then
+                        s.spawnOrder[#s.spawnOrder+1]=data.Id
+                        if #s.spawnOrder>256 then s.spawn[table.remove(s.spawnOrder,1)]=nil end
+                    end
+                    s.spawn[data.Id]=data s.nextTargets=0
+                end
+            elseif action=="Caught" then
                 s.report.caught=s.report.caught+1 s.pulling[id]=nil event(s,"server_Caught",{id=id,used=used,capacity=cap})
-                if s.targetId==id then setTarget(s,nil) end
+                s.completed[id]=true local obj=s.objects[id] if obj then s.doneObjects[obj]=true end
+                if s.targetId==id or obj and s.target==obj then setTarget(s,nil) end
+                s.nextTargets=0
             elseif action=="Released" or action=="Refused" then s.pulling[id]=nil event(s,"server_"..action,{id=id}) end
         end,s.listeners)
         connect(UIS.InputBegan,function(input)
@@ -481,11 +655,25 @@ end
 close=function()
     if not alive then return end stop(false,"Fechado") alive=false probe.enabled=false disconnect(lifetime) gui:Destroy()
 end
-env.ScrapPCDebug={Start=start,Stop=stop,Copy=copy,Close=close,GetReport=function() return active and active.report or lastReport end}
+local function setPriority(kind,value)
+    if kind=="ouro" then kind="gold" elseif kind=="vazio" then kind="void" end
+    if kind~="gold" and kind~="void" then return end
+    preferences[kind]=value==nil and not preferences[kind] or value==true
+    goldButton.Text="Ouro: "..(preferences.gold and "ON" or "OFF") voidButton.Text="Vazio: "..(preferences.void and "ON" or "OFF")
+    if active then active.report.preferences={ouro=preferences.gold,vazio=preferences.void} active.nextTargets=0 end
+end
+local function openPanel()
+    -- Libera o ponteiro ANTES de tornar a interface clicavel.
+    if active then stop(false,"Interface aberta • OFF") end
+    panel.Position=mini.Position panel.Visible=true mini.Visible=false
+end
+env.ScrapPCDebug={Start=start,Stop=stop,Copy=copy,Close=close,SetPriority=setPriority,OpenPanel=openPanel,GetReport=function() return active and active.report or lastReport end}
 connect(toggleButton.Activated,function() if active then stop(true) else start() end end,lifetime)
 connect(copyButton.Activated,function() if active then stop(true) else copy() end end,lifetime)
 connect(miniButton.Activated,function() mini.Position=panel.Position panel.Visible=false mini.Visible=true end,lifetime)
-connect(mini.Activated,function() panel.Position=mini.Position panel.Visible=true mini.Visible=false end,lifetime)
+connect(mini.Activated,openPanel,lifetime)
+connect(goldButton.Activated,function() setPriority("gold") end,lifetime)
+connect(voidButton.Activated,function() setPriority("void") end,lifetime)
 connect(exitButton.Activated,close,lifetime)
 local dragging,dragInput,dragStart,dragPosition
 connect(title.InputBegan,function(input)
@@ -496,7 +684,7 @@ end,lifetime)
 connect(UIS.InputChanged,function(input)
     if dragging and ((dragInput and input==dragInput) or (not dragInput and input.UserInputType==Enum.UserInputType.MouseMovement)) then
         local delta=input.Position-dragStart local v=workspace.CurrentCamera.ViewportSize
-        panel.Position=UDim2.fromOffset(math.clamp(dragPosition.X.Offset+delta.X,0,math.max(0,v.X-302)),math.clamp(dragPosition.Y.Offset+delta.Y,0,math.max(0,v.Y-206)))
+        panel.Position=UDim2.fromOffset(math.clamp(dragPosition.X.Offset+delta.X,0,math.max(0,v.X-302)),math.clamp(dragPosition.Y.Offset+delta.Y,0,math.max(0,v.Y-250)))
     end
 end,lifetime)
 connect(UIS.InputEnded,function(input) if input==dragInput or input.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end,lifetime)
