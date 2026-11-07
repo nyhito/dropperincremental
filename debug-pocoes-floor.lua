@@ -1,4 +1,4 @@
--- DebrisMagnet / Auto Pull v4. Consulta de segurar restrita a rotina original.
+-- DebrisMagnet / Auto Pull v5. Entrada aprendida por mudancas durante um toque real.
 -- Sem ponteiro virtual, TP, alteracao da barra, forca ou quantidade de alvos.
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -8,6 +8,7 @@ local Http=game:GetService("HttpService")
 local player=Players.LocalPlayer
 assert(player and game.PlaceId==70960300100792,"Execute no jogo configurado.")
 local env=(type(getgenv)=="function" and getgenv()) or _G
+local legacy=env.__NetoMagnetHoldProbe
 if env.MagnetDebug and type(env.MagnetDebug.Close)=="function" then pcall(env.MagnetDebug.Close) end
 if type(env.__NetoMagnetProbe)=="table" then env.__NetoMagnetProbe.enabled=false end
 local pg=player:WaitForChild("PlayerGui")
@@ -76,11 +77,11 @@ local function button(text,x,y,width)
     b.BackgroundColor3=Color3.fromRGB(66,49,110) b.Position=UDim2.fromOffset(x,y) b.Size=UDim2.fromOffset(width,35) b.Parent=panel
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,6) return b
 end
-local title=Instance.new("TextLabel") title.Text="AUTO PULL / V4" title.Font=Enum.Font.GothamBold title.TextSize=14
+local title=Instance.new("TextLabel") title.Text="AUTO PULL / V5" title.Font=Enum.Font.GothamBold title.TextSize=14
 title.BackgroundTransparency=1 title.TextColor3=Color3.new(1,1,1) title.Position=UDim2.fromOffset(10,0) title.Size=UDim2.fromOffset(220,36) title.Active=true title.Parent=panel
 local minimize=button("-",244,1,32) local exit=button("X",282,1,33)
 local toggle=button("Auto Pull: OFF",10,43,305) local copyButton=button("Copiar debug",10,85,305)
-local label=Instance.new("TextLabel") label.Text="Equipe o ima, aponte para um item e ative.\nSomente Auto Pull nesta versao."
+local label=Instance.new("TextLabel") label.Text="Ative, segure no jogo ate a barra avancar e solte uma vez.\nEle identifica a entrada e testa manter sozinho."
 label.TextWrapped=true label.TextXAlignment=Enum.TextXAlignment.Left label.TextYAlignment=Enum.TextYAlignment.Top
 label.Font=Enum.Font.Gotham label.TextSize=12 label.TextColor3=Color3.new(1,1,1) label.BackgroundTransparency=1
 label.Position=UDim2.fromOffset(10,130) label.Size=UDim2.fromOffset(305,76) label.Parent=panel
@@ -91,43 +92,12 @@ output.Position=label.Position output.Size=label.Size output.Visible=false outpu
 local mini=Instance.new("TextButton") mini.Text="PULL" mini.Font=Enum.Font.GothamBold mini.TextSize=12 mini.TextColor3=Color3.new(1,1,1)
 mini.BackgroundColor3=Color3.fromRGB(66,49,110) mini.Size=UDim2.fromOffset(64,35) mini.Position=panel.Position mini.Visible=false mini.Parent=gui
 
--- Estado separado por coroutine: somente consultas feitas pela rotina do ima.
+local setUp=(debug and debug.setupvalue) or env.setupvalue
+local learned=nil
 local probe=env.__NetoMagnetHoldProbe
-if type(probe)~="table" or probe.version~=2 then
+if type(probe)~="table" or probe.version~=3 then
     if type(probe)=="table" then probe.enabled=false probe.hold=false end
-    probe={version=2,installed=false,enabled=false,stepHooks=setmetatable({},{__mode="k"}),methodHooks={},inside=setmetatable({},{__mode="k"})}
-    env.__NetoMagnetHoldProbe=probe
-end
-local hookFn=hookfunction or env.hookfunction
-local infoFn=debug and debug.info
-local oldInfo=(debug and debug.getinfo) or env.getinfo
-local mouseButton=Enum.UserInputType.MouseButton1
-local downInput={UserInputType=mouseButton,UserInputState=Enum.UserInputState.Begin,KeyCode=Enum.KeyCode.Unknown,Position=Vector3.new(0,0,0),Delta=Vector3.new(0,0,0)}
-local function inMagnet()
-    if not probe.step then return false end
-    if probe.inside[coroutine.running()]==probe.step then return true end
-    if probe.gated and not probe.stackFallback then return false end
-    for level=3,15 do
-        local ok,fn=false,nil
-        if type(infoFn)=="function" then ok,fn=pcall(infoFn,level,"f")
-        elseif type(oldInfo)=="function" then
-            local item
-            ok,item=pcall(oldInfo,level,"f") fn=ok and item and item.func
-        else break end
-        if ok and type(fn)=="function" and (fn==probe.step or fn==probe.originalStep) then return true end
-    end
-    return false
-end
-local function query(self,method,arg)
-    if not probe.enabled or self~=UIS or (method~="IsMouseButtonPressed" and method~="GetMouseButtonsPressed") then return false end
-    if not inMagnet() then return false end
-    probe.reads[method]=(probe.reads[method] or 0)+1
-    if not probe.hold then return false end
-    if method=="IsMouseButtonPressed" and arg~=mouseButton then return false end
-    probe.overrides=probe.overrides+1
-    probe.forced[method]=(probe.forced[method] or 0)+1
-    if method=="IsMouseButtonPressed" then return true,true end
-    return true,{downInput}
+    probe={version=3,installed=false,enabled=false,stepRefs=setmetatable({},{__mode="k"})} env.__NetoMagnetHoldProbe=probe
 end
 local function install()
     if probe.installed then return true end
@@ -135,176 +105,281 @@ local function install()
     if type(hook)~="function" or type(method)~="function" then return false end
     local original
     local wrapper=function(self,...)
-        if probe.enabled then
-            local name=method()
-            if self==UIS then
-                local first=... local handled,value=query(self,name,first)
-                if handled then return value end
-            elseif self==probe.remote and name=="FireServer" then
-                if probe.tail-probe.head<128 then
-                    local action,id=...
-                    probe.tail=probe.tail+1
-                    probe.queue[probe.tail]={action=action,id=id,at=os.clock(),own=probe.ownStop==true,overrides=probe.overrides}
-                else probe.dropped=probe.dropped+1 end
-            end
+        if probe.enabled and self==probe.remote and method()=="FireServer" then
+            if probe.tail-probe.head<128 then
+                local action,id=... probe.tail=probe.tail+1
+                probe.queue[probe.tail]={action=action,id=id,at=os.clock(),own=probe.ownStop==true}
+            else probe.dropped=probe.dropped+1 end
         end
         return original(self,...)
     end
     local native=newcclosure or env.newcclosure if type(native)=="function" then wrapper=native(wrapper) end
     local ok,result=pcall(hook,game,"__namecall",wrapper)
-    if ok then original=result probe.installed=true end
-    return ok
-end
-local function gateStep(s)
-    local fn=s.step.fn local record=probe.stepHooks[fn]
-    if record then probe.originalStep=record.original probe.gated=true s.report.scope="rotina do ima / coroutine" return true end
-    if type(hookFn)~="function" then
-        probe.gated=false s.report.scope="pilha da rotina do ima"
-        return type(infoFn)=="function" or type(oldInfo)=="function"
-    end
-    local original
-    local wrapper=function(...)
-        if not probe.enabled or probe.step~=fn then return original(...) end
-        local thread=coroutine.running() local previous=probe.inside[thread]
-        probe.inside[thread]=fn probe.stepCalls=probe.stepCalls+1
-        local results=table.pack(pcall(original,...))
-        probe.inside[thread]=previous
-        if not results[1] then error(results[2],0) end
-        return table.unpack(results,2,results.n)
-    end
-    local ok,result=pcall(hookFn,fn,wrapper)
-    if ok and type(result)=="function" then
-        original=result probe.originalStep=result probe.stepHooks[fn]={source=s.step.source,inputConstants=s.report.inputConstants,original=result}
-        probe.gated=true s.report.scope="rotina do ima / coroutine" return true
-    end
-    s.report.gateError=tostring(result):sub(1,160) probe.gated=false
-    return type(infoFn)=="function" or type(oldInfo)=="function"
-end
-local function hookQueries(s)
-    if type(hookFn)~="function" then return end
-    for _,method in ipairs({"IsMouseButtonPressed","GetMouseButtonsPressed"}) do
-        local selectedMethod=method
-        if not probe.methodHooks[method] then
-            local ok,fn=pcall(function() return UIS[method] end)
-            if ok and type(fn)=="function" then
-                local original
-                local wrapper=function(self,...)
-                    local first=... local handled,value=query(self,selectedMethod,first)
-                    if handled then return value end
-                    return original(self,...)
-                end
-                local good,result=pcall(hookFn,fn,wrapper)
-                if good and type(result)=="function" then original=result probe.methodHooks[method]=true
-                else s.report.methodHookError=tostring(result):sub(1,160) end
-            end
-        end
-    end
+    if ok then original=result probe.installed=true end return ok
 end
 local function drain(s)
     while probe.head<=probe.tail do
         local row=probe.queue[probe.head] probe.queue[probe.head]=nil probe.head=probe.head+1
-        if type(row.action)=="string" and (row.action=="Start" or row.action=="Catch" or row.action=="Stop") then
-            s.report.gameSent[row.action]=(s.report.gameSent[row.action] or 0)+(row.own and 0 or 1)
+        if row.action=="Start" or row.action=="Catch" or row.action=="Stop" then
+            if not row.own then s.report.gameSent[row.action]=(s.report.gameSent[row.action] or 0)+1 end
             if row.action=="Start" and type(row.id)=="number" then
-                s.pending[row.id]={started=row.at,manual=s.report.manualTouches,clean=next(s.touches)==nil and row.at>s.lastManualEnd+.3,overrides=row.overrides}
-            elseif row.action=="Stop" and type(row.id)=="number" then s.pending[row.id]=nil end
+                s.pending[row.id]={started=row.at,manual=s.report.manualTouches,clean=next(s.touches)==nil and row.at>s.lastManualEnd+.3,binding=s.binding and s.binding.confirmed==true}
+            elseif row.action=="Stop" and row.id~=nil then s.pending[row.id]=nil end
             event(s,row.own and "cleanup" or "game_send",row.action,{id=row.id})
         end
     end
     probe.queue={} probe.head=1 probe.tail=0
 end
+local function readRef(ref,cache)
+    if ref.kind=="table" then return rawget(ref.owner,ref.key) end
+    if ref.kind=="value" then return ref.owner.Value end
+    local v
+    if cache then v=cache[ref.fn] if v==nil then v=values(ref.fn) or false cache[ref.fn]=v end else v=values(ref.fn) end
+    return v and v[ref.key]
+end
+local function writeRef(ref,value)
+    if ref.kind=="table" then ref.owner[ref.key]=value
+    elseif ref.kind=="value" then ref.owner.Value=value
+    else assert(type(setUp)=="function","Executor sem setupvalue") setUp(ref.fn,ref.key,value) end
+end
 local function release(s,reason)
-    if probe.hold then event(s,"input","released",{reason=reason}) end
-    probe.hold=false s.report.inputRestored=true
+    local b=s.binding
+    if b and b.wrote then
+        local ok,err=pcall(writeRef,b.ref,b.original)
+        local readOk,current=pcall(readRef,b.ref)
+        s.report.inputRestored=ok and readOk and current==b.original
+        if not ok then s.report.restoreError=tostring(err):sub(1,140) end
+        b.wrote=false event(s,"input","released",{path=b.ref.path,reason=reason})
+    end
+    s.binding=nil
 end
 local function stopPending(s)
     if not s.remote then return end
-    for id in pairs(s.pending) do
+    local ids={} for id in pairs(s.pending) do ids[#ids+1]=id end
+    for _,id in ipairs(ids) do
         probe.ownStop=true local ok=pcall(function() s.remote:FireServer("Stop",id) end) probe.ownStop=false
         if ok then s.report.cleanupStops=s.report.cleanupStops+1 end
-    end
-    s.pending={}
+    end s.pending={}
 end
 local function findStep(s)
     if type(getConnections)~="function" or type(getConstants)~="function" or type(getup)~="function" then return end
-    local ok,list=pcall(getConnections,Run.RenderStepped)
-    if not ok or type(list)~="table" then return end
+    local ok,list=pcall(getConnections,Run.RenderStepped) if not ok or type(list)~="table" then return end
     for i,c in ipairs(list) do
         if i>160 then break end
         local good,fn,foreign=pcall(function() return c.Function,c.ForeignState end)
         if good and not foreign and type(fn)=="function" and not own[fn] then
-            local source="" local cached=probe.stepHooks[fn]
-            if cached then source=cached.source
-            elseif type(getfenv)=="function" then pcall(function() local e=getfenv(fn) local script=rawget(e,"script") if typeof(script)=="Instance" then source=path(script) end end) end
+            local cached=probe.stepRefs[fn] or (legacy and legacy.stepRefs and legacy.stepRefs[fn]) or (legacy and legacy.stepHooks and legacy.stepHooks[fn])
+            local actual=cached and (cached.actual or cached.original) or fn
+            local source=cached and cached.source or "" local scriptObject=nil
+            if type(getfenv)=="function" then pcall(function() local e=getfenv(actual) local x=rawget(e,"script") if typeof(x)=="Instance" then scriptObject=x source=path(x) end end) end
             if source:match("PlayerScripts%..*%.DebrisMagnet$") then
-                local read,constants=pcall(getConstants,fn) local marks={}
+                local read,constants=pcall(getConstants,actual) local marks={}
                 if read and type(constants)=="table" then for _,x in pairs(constants) do if type(x)=="string" then marks[x]=true end end end
-                local v=values(fn) local hasPlayer,hasHud=false,false
+                local v=values(actual) local hasPlayer,hasHud=false,false
                 if v then for _,x in pairs(v) do if x==player then hasPlayer=true end if typeof(x)=="Instance" and x.Name=="DebrisHUD" then hasHud=true end end end
-                if cached or (v and hasPlayer and hasHud and marks.DebrisMagnet and marks.GetMagnetStrength and marks.GetPullCount and marks.Progress) then
-                    s.step={fn=fn,source=source} probe.step=fn
-                    s.report.liveStep={source=source,actualConnection=true}
-                    local names={}
-                    for key in pairs(marks) do if #names<150 then names[#names+1]=key end end table.sort(names)
-                    s.report.inputConstants=cached and cached.inputConstants or names
-                    s.scopeReady=gateStep(s) hookQueries(s) return
+                if v and hasPlayer and hasHud and marks.DebrisMagnet and marks.GetMagnetStrength and marks.GetPullCount and marks.Progress then
+                    s.step={fn=actual,source=source,script=scriptObject} probe.stepRefs[fn]={actual=actual,source=source}
+                    s.report.liveStep={source=source,actualConnection=true,unwrappedLegacyHook=actual~=fn}
+                    local names={} for key in pairs(marks) do if #names<150 then names[#names+1]=key end end table.sort(names)
+                    s.report.inputConstants=names return
                 end
             end
         end
     end
 end
-
+local function discoverRefs(s)
+    if not s.step then return end
+    local refs,queue,seenFn,seenTable={},{{value=s.step.fn,path="Step",depth=0}},{},{}
+    local head,nodes=1,0
+    local function addRef(ref)
+        if #refs>=240 then return end
+        ref.id=#refs+1 refs[#refs+1]=ref
+    end
+    while head<=#queue and nodes<420 do
+        local item=queue[head] head=head+1 nodes=nodes+1
+        local x=item.value local kind=typeof(x)
+        if type(x)=="function" and not seenFn[x] then
+            seenFn[x]=true
+            local v=values(x)
+            local audio=false
+            if x~=s.step.fn and type(getConstants)=="function" then
+                local ok,cs=pcall(getConstants,x)
+                if ok and type(cs)=="table" then for _,k in pairs(cs) do if k=="MagnetPull" then audio=true end end end
+            end
+            if v and not audio then
+                local keys={} for k in pairs(v) do if type(k)=="number" then keys[#keys+1]=k end end table.sort(keys)
+                for _,k in ipairs(keys) do
+                    local value=v[k] local p=item.path.."/u"..k
+                    if type(value)=="boolean" then
+                        -- O campo vizinho de UIS foi testado nas V3/V4 e nao sustenta o puxao.
+                        local rejected=x==s.step.fn and v[k+1]==UIS
+                        if not rejected then addRef({kind="upvalue",fn=x,key=k,path=p}) else s.report.excludedDerivedField=p end
+                    elseif item.depth<4 and (type(value)=="function" or type(value)=="table" or (typeof(value)=="Instance" and value.ClassName=="BoolValue")) then
+                        queue[#queue+1]={value=value,path=p,depth=item.depth+1}
+                    end
+                end
+            end
+        elseif kind=="Instance" and x.ClassName=="BoolValue" then addRef({kind="value",owner=x,path=item.path..".Value"})
+        elseif type(x)=="table" and kind=="table" and not seenTable[x] then
+            seenTable[x]=true
+            local chunk=type(rawget(x,"Id"))=="number" and (rawget(x,"Model")~=nil or rawget(x,"Object")~=nil or rawget(x,"Born")~=nil)
+            if not chunk and not (rawget(x,"BaseStrength") and rawget(x,"Chunks")) then
+                local entries={} local count=0
+                for k,v in next,x do count=count+1 if count>70 then break end entries[#entries+1]={key=k,value=v} end
+                table.sort(entries,function(a,b) return tostring(a.key)<tostring(b.key) end)
+                for _,entry in ipairs(entries) do
+                    local k,value=entry.key,entry.value local p=item.path.."/"..tostring(k):sub(1,45)
+                    if type(value)=="boolean" and (not table.isfrozen or not table.isfrozen(x)) then addRef({kind="table",owner=x,key=k,path=p})
+                    elseif item.depth<4 and (type(value)=="function" or type(value)=="table" or (typeof(value)=="Instance" and value.ClassName=="BoolValue")) then
+                        queue[#queue+1]={value=value,path=p,depth=item.depth+1}
+                    end
+                end
+            end
+        end
+    end
+    s.refs=refs s.report.discovery={references=#refs,inspected=nodes,bounded=head<=#queue,paths={}}
+    for i,ref in ipairs(refs) do if i<=48 then s.report.discovery.paths[#s.report.discovery.paths+1]={path=ref.path,kind=ref.kind} end end
+    s.report.rootUpvalues={}
+    for index,value in pairs(values(s.step.fn) or {}) do
+        local row={index=index,type=typeof(value)}
+        if type(value)=="boolean" then row.value=value
+        elseif typeof(value)=="Instance" then row.path=path(value)
+        elseif type(value)=="table" and typeof(value)=="table" then
+            row.fields={} local count=0
+            for key,x in next,value do count=count+1 if count>18 then break end row.fields[#row.fields+1]={key=tostring(key):sub(1,50),type=typeof(x)} end
+        end
+        if #s.report.rootUpvalues<48 then s.report.rootUpvalues[#s.report.rootUpvalues+1]=row end
+    end
+end
+local function snapshot(s)
+    local out,cache={},{}
+    for _,ref in ipairs(s.refs or {}) do
+        local ok,value=pcall(readRef,ref,cache) if ok and type(value)=="boolean" then out[ref.id]=value end
+    end return out
+end
 local function overDebug(input)
     local p=input.Position if not p then return false end
     local ok,list=pcall(function() return pg:GetGuiObjectsAtPosition(p.X,p.Y) end)
-    if ok then for _,obj in ipairs(list) do if obj==gui or obj:IsDescendantOf(gui) then return true end end end
-    return false
+    if ok then for _,x in ipairs(list) do if x==gui or x:IsDescendantOf(gui) then return true end end end return false
 end
 local function onBegin(s,input,processed)
     local kind=input.UserInputType
     if not valid(s) or processed or overDebug(input) or (kind~=Enum.UserInputType.Touch and kind~=Enum.UserInputType.MouseButton1) then return end
     s.report.manualTouches=s.report.manualTouches+1 s.touches[input]=true
-    event(s,"manual","begin",{})
+    if not s.binding and s.step and not s.capture then
+        s.capture={input=input,at=os.clock(),before=s.baseline or {},samples={},peak=s.report.ui.progress or 0}
+        event(s,"manual","calibration_begin",{})
+    end
 end
 local function onEnd(s,input)
     if not valid(s) or not s.touches[input] then return end
-    s.touches[input]=nil s.lastManualEnd=os.clock() event(s,"manual","end",{})
+    s.touches[input]=nil s.lastManualEnd=os.clock()
+    local capture=s.capture if not capture or capture.input~=input then return end
+    s.capture=nil s.releaseWait=true
+    task.delay(.10,function()
+        if not valid(s) then return end
+        s.releaseWait=false local after=snapshot(s) local candidates={} local changes={}
+        for _,ref in ipairs(s.refs or {}) do
+            local before=capture.before[ref.id] local held=capture.samples[ref.id]
+            if held and held.count>=2 and type(before)=="boolean" and held.value~=before and after[ref.id]==before then
+                local score=ref.kind=="table" and 15 or 0 local name=ref.path:lower()
+                for _,word in ipairs({"held","hold","press","touch","down","input","trigger"}) do if name:find(word,1,true) then score=score+40 end end
+                candidates[#candidates+1]={ref=ref,held=held.value,score=score}
+                if #changes<24 then changes[#changes+1]={path=ref.path,kind=ref.kind,before=before,held=held.value,after=after[ref.id]} end
+            end
+        end
+        table.sort(candidates,function(a,b) if a.score==b.score then return a.ref.path<b.ref.path end return a.score>b.score end)
+        s.report.calibration={duration=os.clock()-capture.at,peak=capture.peak,changes=changes}
+        if capture.peak>.01 and os.clock()-capture.at>.4 then
+            s.candidates={} for i=1,math.min(6,#candidates) do s.candidates[#s.candidates+1]=candidates[i] end
+            s.nextCandidate=1
+        end
+        event(s,"manual","calibration_end",{candidates=#candidates,peak=capture.peak})
+    end)
+end
+local function beginTrial(s,candidate)
+    local ref=candidate.ref local ok,original=pcall(readRef,ref)
+    if not ok or type(original)~="boolean" then return false end
+    local wrote,err=pcall(writeRef,ref,candidate.held)
+    if not wrote then event(s,"input","write_failed",{path=ref.path,error=tostring(err):sub(1,100)}) return false end
+    s.report.holdWrites=s.report.holdWrites+1
+    local readOk,readback=pcall(readRef,ref)
+    if not readOk or readback~=candidate.held then pcall(writeRef,ref,original) event(s,"input","write_not_visible",{path=ref.path}) return false end
+    s.binding={ref=ref,original=original,held=candidate.held,started=os.clock(),baseline=s.report.ui.progress or 0,low=s.report.ui.progress or 0,rewrites=0,wrote=true,confirmed=false}
+    s.report.binding={path=ref.path,kind=ref.kind,confirmed=false}
+    event(s,"input","trial_begin",{path=ref.path,held=candidate.held}) return true
 end
 local function tick(s)
     if not valid(s) then return end
-    drain(s)
-    local now=os.clock()
-    local ready,full=hudState(s)
-    if not s.step and now>=(s.nextDiscovery or 0) then s.nextDiscovery=now+1 findStep(s) end
-    s.report.queryReads=probe.reads s.report.queryForced=probe.forced s.report.queryOverrides=probe.overrides s.report.stepCalls=probe.stepCalls
-    if not ready or full then
-        release(s,full and "mochila cheia" or "fora da area/ferramenta")
-        if next(s.pending) then stopPending(s) end
-        s.phase=full and "Mochila cheia: esvazie para continuar" or "Equipe o ima na area de coleta" return
+    drain(s) local now=os.clock() local ready,full,_,percent=hudState(s)
+    if not s.step and now>=(s.nextDiscovery or 0) then
+        s.nextDiscovery=now+1 findStep(s)
+        if s.step then discoverRefs(s) s.baseline=snapshot(s) end
     end
-    if not s.step then s.phase="Procurando a rotina original do ima" return end
-    if not s.scopeReady then release(s,"sem acesso a rotina") s.phase="Executor nao acessou a rotina; pare e copie o debug" return end
-    probe.hold=true
-    if probe.overrides==0 then
-        if now-s.started>1 and (type(infoFn)=="function" or type(oldInfo)=="function") then probe.stackFallback=true s.report.stackFallback=true end
-        s.phase=now-s.started<3 and "Ativando segurar pela consulta de entrada do ima" or "Nenhuma consulta de segurar interceptada; pare e copie o debug"
-    elseif s.report.autonomousCaught>=2 then
-        s.report.autonomousVerified=true s.phase="Auto Pull ativo: coletas sem toque confirmadas"
-    else s.phase="Mantendo segurar; aponte para itens sem segurar a tela" end
+    if not ready or full then
+        release(s,full and "mochila cheia" or "fora da area") stopPending(s)
+        s.phase=full and "Mochila cheia" or "Equipe o ima na area de coleta" return
+    end
+    if not s.step then s.phase="Procurando a rotina ativa do ima" return end
+    if s.capture then
+        s.capture.peak=math.max(s.capture.peak,percent)
+        if now>=(s.nextSample or 0) then
+            s.nextSample=now+.04
+            for id,value in pairs(snapshot(s)) do
+                local item=s.capture.samples[id]
+                if not item or item.value~=value then s.capture.samples[id]={value=value,count=1} else item.count=item.count+1 end
+            end
+        end
+        s.phase="Observando a entrada real: quando a barra avancar, solte" return
+    end
+    if s.releaseWait or next(s.touches) then return end
+    if not s.binding then
+        if learned and learned.fn==s.step.fn then if not beginTrial(s,learned.candidate) then learned=nil end
+        elseif s.candidates then
+            while not s.binding and s.nextCandidate<=#s.candidates do
+                local candidate=s.candidates[s.nextCandidate] s.nextCandidate=s.nextCandidate+1 beginTrial(s,candidate)
+            end
+        end
+    end
+    local b=s.binding
+    if not b then
+        if now>=(s.nextBaseline or 0) then s.nextBaseline=now+.08 s.baseline=snapshot(s) end
+        s.phase="Calibracao: segure no jogo ate a barra avancar e solte uma vez" return
+    end
+    local current=readRef(b.ref)
+    if current~=b.held then
+        b.rewrites=b.rewrites+1
+        local ok,err=pcall(writeRef,b.ref,b.held)
+        if not ok then error(tostring(err)) end s.report.holdWrites=s.report.holdWrites+1
+    else b.rewrites=0 end
+    b.low=math.min(b.low,percent)
+    if b.rewrites>=3 then
+        learned=nil event(s,"input","trial_rejected",{path=b.ref.path,rewrites=b.rewrites,progress=percent})
+        release(s,"campo regravado pelo jogo") stopPending(s) return
+    end
+    if not b.confirmed then
+        if now-b.started>.25 and percent>b.low+.035 and b.rewrites<3 then
+            b.confirmed=true s.report.binding.confirmed=true learned={fn=s.step.fn,candidate={ref=b.ref,held=b.held}}
+            event(s,"input","progress_without_touch",{path=b.ref.path,progress=percent})
+        elseif now-b.started>1.3 then
+            event(s,"input","trial_rejected",{path=b.ref.path,rewrites=b.rewrites,progress=percent})
+            release(s,"nao sustentou progresso sem toque") stopPending(s) return
+        end
+    end
+    if s.report.autonomousCaught>=2 then s.report.autonomousVerified=true end
+    s.phase=s.report.autonomousVerified and "Auto Pull: coletas sem toque confirmadas" or (b.confirmed and "Entrada mantida; validando coletas sem toque" or "Testando entrada depois de soltar a tela")
 end
 local function receive(s,action,id,used,capacity)
-    if not valid(s) then return end
-    drain(s)
+    if not valid(s) then return end drain(s)
     if action=="Caught" and type(id)=="number" and not s.caughtIds[id] then
-        s.caughtIds[id]=true s.report.caughtWhileEnabled=s.report.caughtWhileEnabled+1
-        local pull=s.pending[id]
-        local autonomous=pull and pull.clean and pull.manual==s.report.manualTouches and next(s.touches)==nil and probe.overrides>pull.overrides or false
+        s.caughtIds[id]=true s.report.caughtWhileEnabled=s.report.caughtWhileEnabled+1 local pull=s.pending[id]
+        local autonomous=pull and pull.clean and pull.binding and pull.manual==s.report.manualTouches and next(s.touches)==nil or false
         if autonomous then s.report.autonomousCaught=s.report.autonomousCaught+1 else s.report.assistedOrUnownedCaught=s.report.assistedOrUnownedCaught+1 end
-        append(s.report.catches,{id=id,t=elapsed(s),seconds=pull and os.clock()-pull.started,used=used,capacity=capacity,autonomous=autonomous,manualTouches=s.report.manualTouches},12)
-        s.pending[id]=nil event(s,"server","Caught",{id=id,used=used,capacity=capacity,autonomous=autonomous})
+        append(s.report.catches,{id=id,t=elapsed(s),seconds=pull and os.clock()-pull.started,used=used,capacity=capacity,autonomous=autonomous},12)
+        s.pending[id]=nil event(s,"server","Caught",{id=id,autonomous=autonomous})
     elseif action=="Released" or action=="Refused" then
-        if type(id)=="number" then s.pending[id]=nil end
-        s.report[action]=(s.report[action] or 0)+1 event(s,"server",action,{id=id,used=used,capacity=capacity})
+        if id~=nil then s.pending[id]=nil end
+        s.report[action]=(s.report[action] or 0)+1 event(s,"server",action,{id=id})
     end
 end
 
@@ -312,7 +387,12 @@ copy=function()
     local r=active and active.report or lastReport
     if not r then label.Text="Ative Auto Pull para gerar o resultado." return end
     if active then r.seconds=elapsed(active) end
-    local payload=Http:JSONEncode(r)
+    local export={} for key,value in pairs(r) do export[key]=value end
+    export.events={} for _,value in ipairs(r.events) do export.events[#export.events+1]=value end
+    local payload=Http:JSONEncode(export)
+    if #payload>18000 then export.trimmed=true export.rootUpvalues=nil payload=Http:JSONEncode(export) end
+    if #payload>18000 then export.inputConstants=nil payload=Http:JSONEncode(export) end
+    while #payload>18000 and #export.events>8 do table.remove(export.events,1) payload=Http:JSONEncode(export) end
     env.MagnetDebugReport=payload env.MagnetReports={auto=payload}
     local clip=setclipboard or toclipboard or env.setclipboard or env.toclipboard
     local ok,value=false,nil if type(clip)=="function" then ok,value=pcall(clip,payload) end
@@ -331,18 +411,19 @@ end
 start=function(mode)
     if not alive or active or (mode and mode~="auto") then return end
     local s={started=os.clock(),running=true,links={},pending={},caughtIds={},touches={},lastManualEnd=-math.huge,phase="Iniciando"}
-    s.report={format="magnet-autopull-v4-input-query",mode="auto",placeId=game.PlaceId,running=true,
-        note="Apenas Auto Pull: responde pressionado as consultas de entrada feitas pela rotina do ima. Sem ponteiro virtual, sem escrita de upvalues, sem Start/Catch direto. Coletas com ajuda manual sao separadas; confirmacao automatica exige duas coletas sem toque no ciclo.",
-        capabilities={connections=type(getConnections)=="function",upvalues=type(getup)=="function",constants=type(getConstants)=="function",hookfunction=type(hookFn)=="function",screenInput=false},
+    s.report={format="magnet-autopull-v5-state-discovery",mode="auto",placeId=game.PlaceId,running=true,
+        note="Auto Pull com calibracao: observa mudancas em referencias vivas durante um toque e testa manter a entrada apos soltar. Candidatos sao reversiveis; barra/forca/alvos nao sao modificados. Sem clique virtual nem Start/Catch direto. So duas coletas completas sem toque confirmam o auto.",
+        capabilities={connections=type(getConnections)=="function",upvalues=type(getup)=="function",constants=type(getConstants)=="function",setupvalue=type(setUp)=="function",sharedTables=true,screenInput=false},
         gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0},holdWrites=0,cleanupStops=0,caughtWhileEnabled=0,autonomousCaught=0,assistedOrUnownedCaught=0,autonomousVerified=false,manualTouches=0,catches={},events={}}
     active=s lastReport=s.report
     s.report.device={}
     pcall(function() s.report.device.touchEnabled=UIS.TouchEnabled s.report.device.mouseEnabled=UIS.MouseEnabled end)
     pcall(function() s.report.device.lastInputType=tostring(UIS:GetLastInputType()) end)
-    probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.ownStop=false probe.hold=false probe.step=nil probe.originalStep=nil probe.gated=false probe.stackFallback=false probe.reads={} probe.forced={} probe.overrides=0 probe.stepCalls=0
+    probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.ownStop=false
     local folder=RS:FindFirstChild("Remotes") local remote=folder and folder:FindFirstChild("DebrisMagnet")
     if remote and remote:IsA("RemoteEvent") then s.remote=remote probe.remote=remote connect(remote.OnClientEvent,function(...) receive(s,...) end,s.links) end
     s.report.outgoingCapture=install() probe.enabled=s.report.outgoingCapture findStep(s)
+    if s.step then discoverRefs(s) s.baseline=snapshot(s) end
     connect(UIS.InputBegan,function(input,processed) onBegin(s,input,processed) end,s.links)
     connect(UIS.InputEnded,function(input) onEnd(s,input) end,s.links)
     connect(Run.RenderStepped,function()
