@@ -1,4 +1,4 @@
--- DebrisMagnet / Auto Pull v3. Apenas segurar; a rotina original escolhe e coleta.
+-- DebrisMagnet / Auto Pull v4. Consulta de segurar restrita a rotina original.
 -- Sem ponteiro virtual, TP, alteracao da barra, forca ou quantidade de alvos.
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -12,12 +12,11 @@ if env.MagnetDebug and type(env.MagnetDebug.Close)=="function" then pcall(env.Ma
 if type(env.__NetoMagnetProbe)=="table" then env.__NetoMagnetProbe.enabled=false end
 local pg=player:WaitForChild("PlayerGui")
 local alive,active=true,nil
-local lastReport,learned=nil,nil
+local lastReport=nil
 local start,stop,copy,close
 local own=setmetatable({},{__mode="k"})
 local lifetime={}
 local getup=(debug and debug.getupvalues) or env.getupvalues
-local setUp=(debug and debug.setupvalue) or env.setupvalue
 local getConstants=(debug and debug.getconstants) or env.getconstants
 local getConnections=getconnections or env.getconnections
 local function path(x)
@@ -37,11 +36,6 @@ local function values(fn)
     if type(getup)~="function" then return nil end
     local ok,result=pcall(getup,fn)
     return ok and type(result)=="table" and result or nil
-end
-local function booleans(v)
-    local out={} if not v then return out end
-    for k,x in pairs(v) do if type(k)=="number" and type(x)=="boolean" then out[k]=x end end
-    return out
 end
 local function shown(x)
     for _=1,18 do
@@ -82,7 +76,7 @@ local function button(text,x,y,width)
     b.BackgroundColor3=Color3.fromRGB(66,49,110) b.Position=UDim2.fromOffset(x,y) b.Size=UDim2.fromOffset(width,35) b.Parent=panel
     Instance.new("UICorner",b).CornerRadius=UDim.new(0,6) return b
 end
-local title=Instance.new("TextLabel") title.Text="AUTO PULL / V3" title.Font=Enum.Font.GothamBold title.TextSize=14
+local title=Instance.new("TextLabel") title.Text="AUTO PULL / V4" title.Font=Enum.Font.GothamBold title.TextSize=14
 title.BackgroundTransparency=1 title.TextColor3=Color3.new(1,1,1) title.Position=UDim2.fromOffset(10,0) title.Size=UDim2.fromOffset(220,36) title.Active=true title.Parent=panel
 local minimize=button("-",244,1,32) local exit=button("X",282,1,33)
 local toggle=button("Auto Pull: OFF",10,43,305) local copyButton=button("Copiar debug",10,85,305)
@@ -97,12 +91,43 @@ output.Position=label.Position output.Size=label.Size output.Visible=false outpu
 local mini=Instance.new("TextButton") mini.Text="PULL" mini.Font=Enum.Font.GothamBold mini.TextSize=12 mini.TextColor3=Color3.new(1,1,1)
 mini.BackgroundColor3=Color3.fromRGB(66,49,110) mini.Size=UDim2.fromOffset(64,35) mini.Position=panel.Position mini.Visible=false mini.Parent=gui
 
--- O hook observa apenas DebrisMagnet e preserva os argumentos e retornos.
--- Nenhuma API de Instance/JSON e nenhuma funcao do jogo e chamada dentro dele.
+-- Estado separado por coroutine: somente consultas feitas pela rotina do ima.
 local probe=env.__NetoMagnetHoldProbe
-if type(probe)~="table" or probe.version~=1 then
-    if type(probe)=="table" then probe.enabled=false end
-    probe={version=1,installed=false,enabled=false} env.__NetoMagnetHoldProbe=probe
+if type(probe)~="table" or probe.version~=2 then
+    if type(probe)=="table" then probe.enabled=false probe.hold=false end
+    probe={version=2,installed=false,enabled=false,stepHooks=setmetatable({},{__mode="k"}),methodHooks={},inside=setmetatable({},{__mode="k"})}
+    env.__NetoMagnetHoldProbe=probe
+end
+local hookFn=hookfunction or env.hookfunction
+local infoFn=debug and debug.info
+local oldInfo=(debug and debug.getinfo) or env.getinfo
+local mouseButton=Enum.UserInputType.MouseButton1
+local downInput={UserInputType=mouseButton,UserInputState=Enum.UserInputState.Begin,KeyCode=Enum.KeyCode.Unknown,Position=Vector3.new(0,0,0),Delta=Vector3.new(0,0,0)}
+local function inMagnet()
+    if not probe.step then return false end
+    if probe.inside[coroutine.running()]==probe.step then return true end
+    if probe.gated and not probe.stackFallback then return false end
+    for level=3,15 do
+        local ok,fn=false,nil
+        if type(infoFn)=="function" then ok,fn=pcall(infoFn,level,"f")
+        elseif type(oldInfo)=="function" then
+            local item
+            ok,item=pcall(oldInfo,level,"f") fn=ok and item and item.func
+        else break end
+        if ok and type(fn)=="function" and (fn==probe.step or fn==probe.originalStep) then return true end
+    end
+    return false
+end
+local function query(self,method,arg)
+    if not probe.enabled or self~=UIS or (method~="IsMouseButtonPressed" and method~="GetMouseButtonsPressed") then return false end
+    if not inMagnet() then return false end
+    probe.reads[method]=(probe.reads[method] or 0)+1
+    if not probe.hold then return false end
+    if method=="IsMouseButtonPressed" and arg~=mouseButton then return false end
+    probe.overrides=probe.overrides+1
+    probe.forced[method]=(probe.forced[method] or 0)+1
+    if method=="IsMouseButtonPressed" then return true,true end
+    return true,{downInput}
 end
 local function install()
     if probe.installed then return true end
@@ -110,12 +135,18 @@ local function install()
     if type(hook)~="function" or type(method)~="function" then return false end
     local original
     local wrapper=function(self,...)
-        if probe.enabled and self==probe.remote and method()=="FireServer" then
-            if probe.tail-probe.head<128 then
-                local action,id=...
-                probe.tail=probe.tail+1
-                probe.queue[probe.tail]={action=action,id=id,at=os.clock(),own=probe.ownStop==true}
-            else probe.dropped=probe.dropped+1 end
+        if probe.enabled then
+            local name=method()
+            if self==UIS then
+                local first=... local handled,value=query(self,name,first)
+                if handled then return value end
+            elseif self==probe.remote and name=="FireServer" then
+                if probe.tail-probe.head<128 then
+                    local action,id=...
+                    probe.tail=probe.tail+1
+                    probe.queue[probe.tail]={action=action,id=id,at=os.clock(),own=probe.ownStop==true,overrides=probe.overrides}
+                else probe.dropped=probe.dropped+1 end
+            end
         end
         return original(self,...)
     end
@@ -124,13 +155,58 @@ local function install()
     if ok then original=result probe.installed=true end
     return ok
 end
+local function gateStep(s)
+    local fn=s.step.fn local record=probe.stepHooks[fn]
+    if record then probe.originalStep=record.original probe.gated=true s.report.scope="rotina do ima / coroutine" return true end
+    if type(hookFn)~="function" then
+        probe.gated=false s.report.scope="pilha da rotina do ima"
+        return type(infoFn)=="function" or type(oldInfo)=="function"
+    end
+    local original
+    local wrapper=function(...)
+        if not probe.enabled or probe.step~=fn then return original(...) end
+        local thread=coroutine.running() local previous=probe.inside[thread]
+        probe.inside[thread]=fn probe.stepCalls=probe.stepCalls+1
+        local results=table.pack(pcall(original,...))
+        probe.inside[thread]=previous
+        if not results[1] then error(results[2],0) end
+        return table.unpack(results,2,results.n)
+    end
+    local ok,result=pcall(hookFn,fn,wrapper)
+    if ok and type(result)=="function" then
+        original=result probe.originalStep=result probe.stepHooks[fn]={source=s.step.source,inputConstants=s.report.inputConstants,original=result}
+        probe.gated=true s.report.scope="rotina do ima / coroutine" return true
+    end
+    s.report.gateError=tostring(result):sub(1,160) probe.gated=false
+    return type(infoFn)=="function" or type(oldInfo)=="function"
+end
+local function hookQueries(s)
+    if type(hookFn)~="function" then return end
+    for _,method in ipairs({"IsMouseButtonPressed","GetMouseButtonsPressed"}) do
+        local selectedMethod=method
+        if not probe.methodHooks[method] then
+            local ok,fn=pcall(function() return UIS[method] end)
+            if ok and type(fn)=="function" then
+                local original
+                local wrapper=function(self,...)
+                    local first=... local handled,value=query(self,selectedMethod,first)
+                    if handled then return value end
+                    return original(self,...)
+                end
+                local good,result=pcall(hookFn,fn,wrapper)
+                if good and type(result)=="function" then original=result probe.methodHooks[method]=true
+                else s.report.methodHookError=tostring(result):sub(1,160) end
+            end
+        end
+    end
+end
 local function drain(s)
     while probe.head<=probe.tail do
         local row=probe.queue[probe.head] probe.queue[probe.head]=nil probe.head=probe.head+1
         if type(row.action)=="string" and (row.action=="Start" or row.action=="Catch" or row.action=="Stop") then
-            local r=s.report
-            r.gameSent[row.action]=(r.gameSent[row.action] or 0)+(row.own and 0 or 1)
-            if row.action=="Start" and type(row.id)=="number" then s.pending[row.id]=row.at s.lastStart=row.at
+            s.report.gameSent[row.action]=(s.report.gameSent[row.action] or 0)+(row.own and 0 or 1)
+            if row.action=="Start" and type(row.id)=="number" then
+                s.pending[row.id]={started=row.at,manual=s.report.manualTouches,clean=next(s.touches)==nil and row.at>s.lastManualEnd+.3,overrides=row.overrides}
             elseif row.action=="Stop" and type(row.id)=="number" then s.pending[row.id]=nil end
             event(s,row.own and "cleanup" or "game_send",row.action,{id=row.id})
         end
@@ -138,20 +214,13 @@ local function drain(s)
     probe.queue={} probe.head=1 probe.tail=0
 end
 local function release(s,reason)
-    if s.binding and s.binding.wrote then
-        local ok,err=pcall(setUp,s.binding.fn,s.binding.index,s.binding.original)
-        s.report.inputRestored=ok
-        if not ok then s.report.restoreError=tostring(err):sub(1,160) end
-        s.binding.wrote=false
-        event(s,"input","released",{reason=reason,index=s.binding.index})
-    end
+    if probe.hold then event(s,"input","released",{reason=reason}) end
+    probe.hold=false s.report.inputRestored=true
 end
 local function stopPending(s)
     if not s.remote then return end
     for id in pairs(s.pending) do
-        probe.ownStop=true
-        local ok=pcall(function() s.remote:FireServer("Stop",id) end)
-        probe.ownStop=false
+        probe.ownStop=true local ok=pcall(function() s.remote:FireServer("Stop",id) end) probe.ownStop=false
         if ok then s.report.cleanupStops=s.report.cleanupStops+1 end
     end
     s.pending={}
@@ -164,53 +233,27 @@ local function findStep(s)
         if i>160 then break end
         local good,fn,foreign=pcall(function() return c.Function,c.ForeignState end)
         if good and not foreign and type(fn)=="function" and not own[fn] then
-            local source=""
-            if type(getfenv)=="function" then pcall(function() local e=getfenv(fn) local script=rawget(e,"script") if typeof(script)=="Instance" then source=path(script) end end) end
+            local source="" local cached=probe.stepHooks[fn]
+            if cached then source=cached.source
+            elseif type(getfenv)=="function" then pcall(function() local e=getfenv(fn) local script=rawget(e,"script") if typeof(script)=="Instance" then source=path(script) end end) end
             if source:match("PlayerScripts%..*%.DebrisMagnet$") then
-                local read,constants=pcall(getConstants,fn)
-                local marks={}
+                local read,constants=pcall(getConstants,fn) local marks={}
                 if read and type(constants)=="table" then for _,x in pairs(constants) do if type(x)=="string" then marks[x]=true end end end
                 local v=values(fn) local hasPlayer,hasHud=false,false
-                if v then for _,x in pairs(v) do
-                    if x==player then hasPlayer=true end
-                    if typeof(x)=="Instance" and x.Name=="DebrisHUD" then hasHud=true end
-                end end
-                if v and hasPlayer and hasHud and marks.DebrisMagnet and marks.GetMagnetStrength and marks.GetPullCount and marks.Progress then
-                    s.step={fn=fn,source=source} s.report.liveStep={source=source,actualConnection=true}
-                    s.boolFrame=booleans(v) return
+                if v then for _,x in pairs(v) do if x==player then hasPlayer=true end if typeof(x)=="Instance" and x.Name=="DebrisHUD" then hasHud=true end end end
+                if cached or (v and hasPlayer and hasHud and marks.DebrisMagnet and marks.GetMagnetStrength and marks.GetPullCount and marks.Progress) then
+                    s.step={fn=fn,source=source} probe.step=fn
+                    s.report.liveStep={source=source,actualConnection=true}
+                    local names={}
+                    for key in pairs(marks) do if #names<150 then names[#names+1]=key end end table.sort(names)
+                    s.report.inputConstants=cached and cached.inputConstants or names
+                    s.scopeReady=gateStep(s) hookQueries(s) return
                 end
             end
         end
     end
 end
-local function chooseCandidate(s,v)
-    -- Indice dinamico: booleano vizinho de UIS/GuiService na funcao viva.
-    local found={}
-    for index,value in pairs(v) do
-        if type(index)=="number" and type(value)=="boolean" and v[index+1]==UIS then
-            local neighbor=v[index+2]
-            if typeof(neighbor)=="Instance" and neighbor.ClassName=="GuiService" then found[#found+1]=index end
-        end
-    end
-    s.report.inputCandidates=found
-    return #found==1 and found[1] or nil
-end
-local function bind(s,index,kind)
-    if not s.step or type(setUp)~="function" then return false end
-    local v=values(s.step.fn) if not v or type(v[index])~="boolean" then return false end
-    s.binding={fn=s.step.fn,index=index,original=v[index],kind=kind,started=os.clock(),baselineProgress=s.report.ui.progress or 0,
-        starts=s.report.gameSent.Start or 0,catchesAtBind=s.report.caughtWhileEnabled,peak=0,wrote=false}
-    s.report.binding={index=index,source=s.step.source,method=kind,confirmed=false}
-    event(s,"input","binding_test",{index=index,method=kind}) return true
-end
-local function keepHeld(s)
-    local b=s.binding local v=values(b.fn)
-    if not v or type(v[b.index])~="boolean" then error("Estado de entrada nao esta mais disponivel") end
-    if v[b.index]~=true then
-        local ok,err=pcall(setUp,b.fn,b.index,true) if not ok then error(tostring(err)) end
-        b.wrote=true s.report.holdWrites=s.report.holdWrites+1
-    end
-end
+
 local function overDebug(input)
     local p=input.Position if not p then return false end
     local ok,list=pcall(function() return pg:GetGuiObjectsAtPosition(p.X,p.Y) end)
@@ -220,90 +263,51 @@ end
 local function onBegin(s,input,processed)
     local kind=input.UserInputType
     if not valid(s) or processed or overDebug(input) or (kind~=Enum.UserInputType.Touch and kind~=Enum.UserInputType.MouseButton1) then return end
-    s.report.manualTouches=s.report.manualTouches+1
-    if s.binding or not s.step or s.manual then return end
-    s.manual={input=input,before=s.boolFrame or {},fn=s.step.fn,at=os.clock(),starts=s.report.gameSent.Start or 0,peak=s.report.ui.progress or 0,duringCount={}}
-    event(s,"manual","begin",{booleans=s.manual.before})
+    s.report.manualTouches=s.report.manualTouches+1 s.touches[input]=true
+    event(s,"manual","begin",{})
 end
 local function onEnd(s,input)
-    local attempt=s.manual if not valid(s) or not attempt or attempt.input~=input then return end
-    s.manual=nil s.releaseWait=true
-    task.delay(.08,function()
-        if not valid(s) or not s.step or attempt.fn~=s.step.fn then return end
-        s.releaseWait=false
-        local after=booleans(values(attempt.fn)) local candidates={}
-        for index,before in pairs(attempt.before) do
-            if before==false and (attempt.duringCount[index] or 0)>=2 and after[index]==false then candidates[#candidates+1]=index end
-        end
-        s.report.learning={duration=os.clock()-attempt.at,candidates=candidates,starts=(s.report.gameSent.Start or 0)-attempt.starts,peak=attempt.peak}
-        if #candidates==1 and os.clock()-attempt.at>=.35 and (attempt.peak>.01 or s.report.learning.starts>0) then
-            learned={fn=attempt.fn,index=candidates[1]} s.report.learning.confirmed=true
-            bind(s,candidates[1],"toque real observado e solto")
-        else s.report.learning.confirmed=false s.phase="Segure 1 segundo no jogo e solte uma vez para identificar a entrada" end
-        event(s,"manual","end",s.report.learning)
-    end)
+    if not valid(s) or not s.touches[input] then return end
+    s.touches[input]=nil s.lastManualEnd=os.clock() event(s,"manual","end",{})
 end
 local function tick(s)
     if not valid(s) then return end
     drain(s)
     local now=os.clock()
-    local ready,full,note,percent=hudState(s)
+    local ready,full=hudState(s)
     if not s.step and now>=(s.nextDiscovery or 0) then s.nextDiscovery=now+1 findStep(s) end
-    if not s.step then s.phase="Procurando a funcao ativa do ima" return end
-    local v=values(s.step.fn) if not v then error("Nao foi possivel ler a funcao ativa") end
-    local current=booleans(v)
-    if not s.binding and not s.manual and not s.releaseWait then s.boolFrame=current end
-    if s.manual then
-        s.manual.peak=math.max(s.manual.peak,percent)
-        for index,value in pairs(current) do if value==true then s.manual.duringCount[index]=(s.manual.duringCount[index] or 0)+1 end end
-        s.phase="Observando o toque real; solte apos 1 segundo" return
-    end
+    s.report.queryReads=probe.reads s.report.queryForced=probe.forced s.report.queryOverrides=probe.overrides s.report.stepCalls=probe.stepCalls
     if not ready or full then
         release(s,full and "mochila cheia" or "fora da area/ferramenta")
         if next(s.pending) then stopPending(s) end
-        s.binding=nil s.phase=full and "Mochila cheia: esvazie para continuar" or "Equipe o ima na area de coleta" return
+        s.phase=full and "Mochila cheia: esvazie para continuar" or "Equipe o ima na area de coleta" return
     end
-    if type(setUp)~="function" then s.phase="Executor sem acesso ao estado de segurar; copie o debug" return end
-    if not s.binding and not s.releaseWait then
-        if learned and learned.fn==s.step.fn then bind(s,learned.index,"entrada ja confirmada")
-        elseif not s.probed then
-            local index=chooseCandidate(s,v) local lower=note:lower()
-            if index and (lower:find("locked",1,true) or lower:find("pulling",1,true) or lower:find("slipping",1,true)) then
-                s.probed=true bind(s,index,"estado ao lado de UIS/GuiService; validacao por Start e barra")
-            elseif not index then s.probed=true end
-        end
-    end
-    if not s.binding then
-        s.phase=s.probed and "Segure 1 segundo no jogo e solte uma vez para identificar a entrada" or "Aponte para um item ate aparecer Locked on" return
-    end
-    keepHeld(s)
-    local b=s.binding b.peak=math.max(b.peak,percent)
-    if not b.confirmed then
-        local progressed=percent>b.baselineProgress+.005 or s.report.caughtWhileEnabled>b.catchesAtBind
-        local started=(s.report.gameSent.Start or 0)>b.starts
-        if b.kind=="toque real observado e solto" or b.kind=="entrada ja confirmada" or (started and progressed) then
-            b.confirmed=true s.report.binding.confirmed=true learned={fn=b.fn,index=b.index}
-            event(s,"input","hold_verified",{index=b.index,gameStart=started,progress=percent})
-        elseif now-b.started>1.2 then
-            release(s,"entrada nao iniciou Start e progresso") stopPending(s)
-            s.binding=nil s.report.probeFailed=true s.boolFrame=booleans(values(s.step.fn))
-            s.phase="Segure 1 segundo no jogo e solte uma vez para identificar a entrada" return
-        end
-    end
-    s.phase=b.confirmed and "Segurando automaticamente; aponte para os itens" or "Verificando o estado real de segurar"
+    if not s.step then s.phase="Procurando a rotina original do ima" return end
+    if not s.scopeReady then release(s,"sem acesso a rotina") s.phase="Executor nao acessou a rotina; pare e copie o debug" return end
+    probe.hold=true
+    if probe.overrides==0 then
+        if now-s.started>1 and (type(infoFn)=="function" or type(oldInfo)=="function") then probe.stackFallback=true s.report.stackFallback=true end
+        s.phase=now-s.started<3 and "Ativando segurar pela consulta de entrada do ima" or "Nenhuma consulta de segurar interceptada; pare e copie o debug"
+    elseif s.report.autonomousCaught>=2 then
+        s.report.autonomousVerified=true s.phase="Auto Pull ativo: coletas sem toque confirmadas"
+    else s.phase="Mantendo segurar; aponte para itens sem segurar a tela" end
 end
 local function receive(s,action,id,used,capacity)
     if not valid(s) then return end
     drain(s)
     if action=="Caught" and type(id)=="number" and not s.caughtIds[id] then
         s.caughtIds[id]=true s.report.caughtWhileEnabled=s.report.caughtWhileEnabled+1
-        append(s.report.catches,{id=id,t=elapsed(s),seconds=s.pending[id] and os.clock()-s.pending[id],used=used,capacity=capacity,manualTouches=s.report.manualTouches},12)
-        s.pending[id]=nil event(s,"server","Caught",{id=id,used=used,capacity=capacity})
+        local pull=s.pending[id]
+        local autonomous=pull and pull.clean and pull.manual==s.report.manualTouches and next(s.touches)==nil and probe.overrides>pull.overrides or false
+        if autonomous then s.report.autonomousCaught=s.report.autonomousCaught+1 else s.report.assistedOrUnownedCaught=s.report.assistedOrUnownedCaught+1 end
+        append(s.report.catches,{id=id,t=elapsed(s),seconds=pull and os.clock()-pull.started,used=used,capacity=capacity,autonomous=autonomous,manualTouches=s.report.manualTouches},12)
+        s.pending[id]=nil event(s,"server","Caught",{id=id,used=used,capacity=capacity,autonomous=autonomous})
     elseif action=="Released" or action=="Refused" then
         if type(id)=="number" then s.pending[id]=nil end
         s.report[action]=(s.report[action] or 0)+1 event(s,"server",action,{id=id,used=used,capacity=capacity})
     end
 end
+
 copy=function()
     local r=active and active.report or lastReport
     if not r then label.Text="Ative Auto Pull para gerar o resultado." return end
@@ -326,13 +330,16 @@ stop=function(_,shouldCopy)
 end
 start=function(mode)
     if not alive or active or (mode and mode~="auto") then return end
-    local s={started=os.clock(),running=true,links={},pending={},caughtIds={},phase="Iniciando"}
-    s.report={format="magnet-autopull-v3-hold-state",mode="auto",placeId=game.PlaceId,running=true,
-        note="Apenas Auto Pull: mantem o estado de segurar e deixa a rotina original escolher/puxar/coletar. Sem clique virtual, sem Start/Catch direto, sem alteracao da barra/forca/quantidade. So Caught conta; nao exclui ajuda manual.",
-        capabilities={connections=type(getConnections)=="function",upvalues=type(getup)=="function",constants=type(getConstants)=="function",setupvalue=type(setUp)=="function",screenInput=false},
-        gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0},holdWrites=0,cleanupStops=0,caughtWhileEnabled=0,manualTouches=0,catches={},events={}}
+    local s={started=os.clock(),running=true,links={},pending={},caughtIds={},touches={},lastManualEnd=-math.huge,phase="Iniciando"}
+    s.report={format="magnet-autopull-v4-input-query",mode="auto",placeId=game.PlaceId,running=true,
+        note="Apenas Auto Pull: responde pressionado as consultas de entrada feitas pela rotina do ima. Sem ponteiro virtual, sem escrita de upvalues, sem Start/Catch direto. Coletas com ajuda manual sao separadas; confirmacao automatica exige duas coletas sem toque no ciclo.",
+        capabilities={connections=type(getConnections)=="function",upvalues=type(getup)=="function",constants=type(getConstants)=="function",hookfunction=type(hookFn)=="function",screenInput=false},
+        gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0},holdWrites=0,cleanupStops=0,caughtWhileEnabled=0,autonomousCaught=0,assistedOrUnownedCaught=0,autonomousVerified=false,manualTouches=0,catches={},events={}}
     active=s lastReport=s.report
-    probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.ownStop=false
+    s.report.device={}
+    pcall(function() s.report.device.touchEnabled=UIS.TouchEnabled s.report.device.mouseEnabled=UIS.MouseEnabled end)
+    pcall(function() s.report.device.lastInputType=tostring(UIS:GetLastInputType()) end)
+    probe.enabled=false probe.queue={} probe.head=1 probe.tail=0 probe.dropped=0 probe.ownStop=false probe.hold=false probe.step=nil probe.originalStep=nil probe.gated=false probe.stackFallback=false probe.reads={} probe.forced={} probe.overrides=0 probe.stepCalls=0
     local folder=RS:FindFirstChild("Remotes") local remote=folder and folder:FindFirstChild("DebrisMagnet")
     if remote and remote:IsA("RemoteEvent") then s.remote=remote probe.remote=remote connect(remote.OnClientEvent,function(...) receive(s,...) end,s.links) end
     s.report.outgoingCapture=install() probe.enabled=s.report.outgoingCapture findStep(s)
@@ -346,7 +353,7 @@ start=function(mode)
             s.report.error=tostring(err):sub(1,200) s.phase="Falha ao manter o toque; pare e copie o debug"
         end
         s.report.phase=s.phase
-        if os.clock()>=(s.nextUi or 0) then s.nextUi=os.clock()+.12 label.Text=s.phase.."\nCapturas confirmadas: "..s.report.caughtWhileEnabled end
+        if os.clock()>=(s.nextUi or 0) then s.nextUi=os.clock()+.12 label.Text=s.phase.."\nColetas sem toque: "..s.report.autonomousCaught end
     end,s.links)
     output.Visible=false label.Visible=true toggle.Text="Auto Pull: ON / parar e copiar"
 end
