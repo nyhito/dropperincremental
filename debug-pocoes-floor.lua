@@ -1,4 +1,4 @@
--- Auto Scrap PC v3.3 / debug. CFly mais alto; camera em terceira pessoa.
+-- Auto Scrap PC v2 / debug. Segura, acompanha dentro do alvo e entrega.
 -- Base 61,3,-432 / entrega 128,3,-407. Sem alterar forca, barra ou pecas.
 local Players=game:GetService("Players")
 local Run=game:GetService("RunService")
@@ -16,8 +16,6 @@ for _,name in ipairs({"__NetoMagnetProbe","__NetoMagnetHoldProbe"}) do
     local old=env[name] if type(old)=="table" then old.enabled=false old.hold=false end
 end
 local BASE,SELL=Vector3.new(61,3,-432),Vector3.new(128,3,-407)
-local RESET=Vector3.new(44,3,-418)
-local FOLLOW_CLEARANCE=2.25
 local pg=player:WaitForChild("PlayerGui")
 local alive,active,lastReport=true,nil,nil
 local start,stop,copy,close,paint,setFrozen
@@ -71,7 +69,7 @@ local toggleButton=button("Auto Scrap: OFF",10,40,282) local copyButton=button("
 local goldButton=button("Ouro: OFF",10,118,137) local voidButton=button("Vazio: OFF",155,118,137)
 local status=Instance.new("TextLabel") status.BackgroundTransparency=1 status.TextColor3=Color3.new(1,1,1)
 status.TextSize=12 status.Font=Enum.Font.Gotham status.TextWrapped=true status.TextXAlignment=Enum.TextXAlignment.Left status.TextYAlignment=Enum.TextYAlignment.Top
-status.Position=UDim2.fromOffset(10,159) status.Size=UDim2.fromOffset(282,83) status.Text="Segue acima do alvo, olhando para baixo.\nBarra falhou: TP de recuperação por 1 segundo.\nInicia em 3s. Abrir esta janela desliga." status.Parent=panel
+status.Position=UDim2.fromOffset(10,159) status.Size=UDim2.fromOffset(282,83) status.Text="Segue dentro do alvo e entrega ao encher.\nVazio > Ouro > normal. Inicia em 3 segundos.\nAbrir esta janela desliga o farm." status.Parent=panel
 local mini=Instance.new("TextButton") mini.Text="SCRAP" mini.Font=Enum.Font.GothamBold mini.TextSize=12 mini.TextColor3=Color3.new(1,1,1)
 mini.BackgroundColor3=Color3.fromRGB(53,73,124) mini.Size=UDim2.fromOffset(78,36) mini.Position=panel.Position mini.Visible=false mini.Parent=gui
 local function freePoint(x,y)
@@ -97,7 +95,7 @@ local function pickPoint(s)
     local c=workspace.CurrentCamera if not c then return nil end
     local v=c.ViewportSize local p=s.point
     if p and p.vx==v.X and p.vy==v.Y and freePoint(p.x,p.y) then return p end
-    for _,fraction in ipairs({{.5,.50},{.5,.40},{.65,.32},{.78,.30},{.42,.34},{.9,.25},{.55,.22},{.94,.45}}) do
+    for _,fraction in ipairs({{.5,.40},{.65,.32},{.78,.30},{.42,.34},{.9,.25},{.55,.22},{.94,.45}}) do
         local x,y=math.floor(v.X*fraction[1]),math.floor(v.Y*fraction[2])
         if freePoint(x,y) then s.point={x=x,y=y,vx=v.X,vy=v.Y} return s.point end
     end s.point=nil return nil
@@ -372,7 +370,6 @@ end
 local function setTarget(s,obj,id,source,classification,evidence)
     if obj==s.target and id==s.targetId then return end
     local previous=s.target
-    s.barPeak=nil s.pendingCatch=nil s.barTargetReady=os.clock()+.25 s.report.barMonitor=nil
     s.target=obj s.targetId=id s.targetAt=os.clock() s.lastProgress=os.clock() s.lastFraction=0
     s.targetMutation=classification or "Desconhecido" s.targetPriority=priority(s.targetMutation)
     if obj then
@@ -483,10 +480,6 @@ local function drain(s)
         local a,id=e.action,e.id
         if s.report.gameSent[a] then s.report.gameSent[a]=s.report.gameSent[a]+1 end
         if a=="Start" then s.pulling[id]=e.at elseif a=="Stop" then s.pulling[id]=nil end
-        if a=="Catch" and (id==s.targetId or s.objects[id]==s.target) and s.target then
-            -- Em FPS baixo, o quadro da barra cheia pode nao aparecer no scanner.
-            s.pendingCatch={obj=s.target,id=id,at=e.at,caught=s.report.caught,used=s.report.ui and s.report.ui.used}
-        end
         if a=="Start" or a=="Stop" or a=="Catch" then event(s,"game_"..a,{id=id}) end
     end
 end
@@ -496,16 +489,13 @@ setFrozen=function(s,value)
         if not s.frozen then
             s.frozen=true s.savedCollisions={}
             for _,part in ipairs(s.char:GetDescendants()) do if part:IsA("BasePart") then s.savedCollisions[part]=part.CanCollide end end
-            event(s,"freeze_above")
+            event(s,"freeze_inside")
         end
         s.root.Anchored=true
-        s.hum.PlatformStand=true s.hum.AutoRotate=false
         for part in pairs(s.savedCollisions) do if part.Parent then part.CanCollide=false end end
         s.root.AssemblyLinearVelocity=Vector3.new(0,0,0) s.root.AssemblyAngularVelocity=Vector3.new(0,0,0)
     elseif s.frozen then
-        s.pose=nil
         s.root.Anchored=s.originalAnchored
-        s.hum.PlatformStand=s.originalPlatformStand
         for part,value in pairs(s.savedCollisions or {}) do if part.Parent then part.CanCollide=value end end
         s.savedCollisions={} s.frozen=false event(s,"unfreeze")
     end
@@ -515,11 +505,8 @@ local function saveCharacter(s,char,root,hum)
     if s.char==char then return end
     if s.hum and s.hum.Parent then pcall(function() s.hum.AutoRotate=s.autoRotate end) end
     if s.char then setFrozen(s,false) release(s) event(s,"respawn") end
-    if s.stage=="resetting" then s.stage="farming" s.resetJourney=nil end
-    s.barPeak=nil
     s.char=char s.root=root s.hum=hum s.autoRotate=hum.AutoRotate s.report.recoveries=s.report.recoveries+(s.hadChar and 1 or 0) s.hadChar=true
     s.originalAnchored=root.Anchored
-    s.originalPlatformStand=hum.PlatformStand
     hum.AutoRotate=false s.atBase=false s.pulling={} setTarget(s,nil)
 end
 local function teleport(s,position,label)
@@ -531,122 +518,19 @@ local function saveCamera(s,camera)
     if s.camera and s.cameraSaved then pcall(function() s.camera.CameraType=s.cameraSaved.type s.camera.CameraSubject=s.cameraSaved.subject s.camera.CFrame=s.cameraSaved.cf end) end
     s.camera=camera s.cameraSaved={type=camera.CameraType,subject=camera.CameraSubject,cf=camera.CFrame,focus=camera.Focus}
 end
-local function aboveAnchor(s,obj,point)
-    local center=point local top=point.Y
-    local ok,box,size=pcall(function()
-        if obj:IsA("BasePart") then return obj.CFrame,obj.Size end
-        if obj:IsA("Model") then return obj:GetBoundingBox() end
-    end)
-    if ok and size then
-        box=box or CFrame.new(point) center=box.Position
-        -- Extensao vertical real da caixa, incluindo objetos inclinados.
-        top=center.Y+math.abs(box.RightVector.Y)*size.X*.5+math.abs(box.UpVector.Y)*size.Y*.5+math.abs(box.LookVector.Y)*size.Z*.5
-    end
-    s.targetBounds={obj=obj,center=center,size=ok and size or nil}
-    return Vector3.new(center.X,top+FOLLOW_CLEARANCE,center.Z)
-end
-local function enforcePose(s)
-    if not valid(s) or not s.pose or not s.frozen or s.stage~="farming" or GS.MenuIsOpen then return end
-    if not s.root or not s.root.Parent or not s.hum or s.hum.Health<=0 then return end
-    s.hum.AutoRotate=false s.hum.PlatformStand=true
-    s.root.CFrame=s.pose.body
-    local c=workspace.CurrentCamera
-    if c==s.camera then c.CameraType=Enum.CameraType.Scriptable c.CFrame=s.pose.camera c.Focus=s.pose.focus end
-end
-local function aim(s,point,anchor,lookDown)
+local function aim(s,point,anchor)
     local c=workspace.CurrentCamera if not c then return false end saveCamera(s,c)
     local p=pickPoint(s) if not p then return false end
     local flat=Vector3.new(point.X,anchor.Y,point.Z)-anchor
     if flat.Magnitude<.1 then flat=Vector3.new(0,0,-1) end
     local forward=flat.Unit local place=anchor+Vector3.new(0,3.5,0)-forward*8
     c.CameraType=Enum.CameraType.Scriptable
-    if lookDown then
-        local heading=s.approach or Vector3.new(0,0,-1)
-        heading=Vector3.new(heading.X,0,heading.Z)
-        heading=heading.Magnitude>.01 and heading.Unit or Vector3.new(0,0,-1)
-        -- CFly: corpo deitado, face exatamente para baixo, nao apenas a cabeca.
-        s.root.CFrame=CFrame.lookAt(anchor,anchor-Vector3.new(0,1,0),heading)
-        -- Vista normal de terceira pessoa: horizonte em pe, independente do corpo deitado.
-        local bounds=s.targetBounds local focus=point local radius=0
-        if bounds and bounds.obj==s.target then
-            focus=bounds.center
-            if bounds.size then radius=bounds.size.Magnitude*.5 end
-        end
-        local halfFov=math.rad(math.clamp(tonumber(c.FieldOfView) or 70,25,110))*.5
-        local aspect=math.max(.2,c.ViewportSize.X/math.max(1,c.ViewportSize.Y))
-        local narrow=math.min(halfFov,math.atan(math.tan(halfFov)*aspect))
-        local distance=math.max(14,radius/math.sin(narrow)*1.2)
-        place=focus-heading*distance+Vector3.new(0,math.max(5,distance*.4),0)
-        local now=os.clock()
-        if s.cameraPosition and s.cameraTarget==s.target and (s.cameraPosition-place).Magnitude<80 then
-            local dt=math.clamp(now-(s.cameraAt or now),0,.1)
-            place=s.cameraPosition+(place-s.cameraPosition)*(1-math.exp(-10*dt))
-        end
-        s.cameraPosition=place s.cameraTarget=s.target s.cameraAt=now
-        c.CFrame=CFrame.lookAt(place,focus,Vector3.new(0,1,0)) c.Focus=CFrame.new(focus)
-        s.pose={body=s.root.CFrame,camera=c.CFrame,focus=c.Focus}
-        s.report.faceDown={bodyY=s.root.CFrame.LookVector.Y,cameraY=c.CFrame.LookVector.Y}
-        s.report.cameraView={mode="third_person",distance=(place-focus).Magnitude,focus=vec(focus),clearance=FOLLOW_CLEARANCE}
-    else
-        s.pose=nil s.cameraPosition=nil s.cameraTarget=nil
-        local look=CFrame.lookAt(place,point) c.CFrame=look
-        local ray=c:ScreenPointToRay(p.x,p.y)
-        local localDirection=look:VectorToObjectSpace(ray.Direction)
-        c.CFrame=look*CFrame.lookAt(Vector3.new(0,0,0),localDirection):Inverse()
-        c.Focus=CFrame.new(point) s.root.CFrame=CFrame.lookAt(anchor,anchor+forward)
-    end
+    local look=CFrame.lookAt(place,point) c.CFrame=look
+    local ray=c:ScreenPointToRay(p.x,p.y)
+    local localDirection=look:VectorToObjectSpace(ray.Direction)
+    c.CFrame=look*CFrame.lookAt(Vector3.new(0,0,0),localDirection):Inverse()
+    c.Focus=CFrame.new(point) s.root.CFrame=CFrame.lookAt(anchor,anchor+forward)
     return true
-end
-local function barFailed(s,u,now)
-    if not s.held or not s.target or not u.visible or now<(s.nextBarReset or 0) or now<(s.barTargetReady or 0) or now-(s.lastCaughtAt or -100) < .3 then
-        s.barPeak=nil s.report.barMonitor=nil return false
-    end
-    local p=s.barPeak local fraction=u.progress
-    if p and (p.obj~=s.target or s.report.caught>p.caught or u.used and p.used and u.used>p.used) then
-        s.barPeak=nil s.report.barMonitor=nil return false
-    end
-    local request=s.pendingCatch
-    if not p and request and request.obj==s.target and now-request.at<.25 then
-        p={obj=s.target,id=s.targetId,peak=1,caught=request.caught,used=request.used,at=now,evidence="game_Catch"} s.barPeak=p s.pendingCatch=nil
-    elseif not p and fraction>=.97 then
-        p={obj=s.target,id=s.targetId,peak=fraction,caught=s.report.caught,used=u.used,at=now,evidence="bar"} s.barPeak=p
-    end
-    if not p then return false end
-    p.peak=math.max(p.peak,fraction)
-    if not p.dropAt and fraction<=p.peak-.25 then
-        p.dropAt=now s.report.barFalls=s.report.barFalls+1
-        event(s,"bar_fell_without_Caught",{id=p.id,peak=p.peak,progress=fraction})
-    end
-    s.report.barMonitor={peak=p.peak,progress=fraction,pending=p.dropAt~=nil}
-    -- Caught pode chegar depois da animacao. Aguarda antes de considerar falha.
-    if not p.dropAt or now-p.dropAt<.55 then return false end
-    s.resetJourney={obj=s.target,id=s.targetId,at=now,returnAt=now+1}
-    s.stage="resetting" s.barPeak=nil s.report.barMonitor=nil
-    s.report.barResets=s.report.barResets+1 s.nextBarReset=now+3
-    setFrozen(s,false) teleport(s,RESET,"TP_reset_bar")
-    s.report.phase="Recuperando barra • esperando 1 segundo"
-    return true
-end
-local function resetTick(s,now)
-    local journey=s.resetJourney
-    if not journey then s.stage="farming" return false end
-    if now<journey.returnAt then
-        -- Estado por frame, sem tarefa atrasada que possa teleportar apos OFF.
-        aim(s,RESET+Vector3.new(0,2,-15),RESET) pointer(s)
-        s.report.phase="Recuperando barra • esperando 1 segundo" return true
-    end
-    s.resetJourney=nil s.stage="farming" s.barPeak=nil s.report.barMonitor=nil
-    s.report.barResetReturns=s.report.barResetReturns+1 s.nextTargets=0
-    local obj=journey.obj local point=objectPosition(obj)
-    if point and inField(obj) and not s.completed[journey.id] and not s.doneObjects[obj] then
-        local label,evidence=mutation(s,obj,journey.id)
-        setTarget(s,obj,journey.id,"bar_reset_return",label,evidence)
-        teleport(s,aboveAnchor(s,obj,point),"TP_reset_return") setFrozen(s,true)
-    else
-        setTarget(s,nil) teleport(s,BASE,"TP_reset_return_base")
-    end
-    event(s,"bar_reset_done",{id=journey.id,waited=now-journey.at})
-    return false
 end
 local function tick(s)
     if not valid(s) then return end drain(s)
@@ -660,11 +544,9 @@ local function tick(s)
     local full=(u.used and u.capacity and u.capacity>0 and u.used>=u.capacity) or (u.visible and u.note:lower():find("backpack full",1,true)~=nil)
     if full and s.stage~="selling" then
         setFrozen(s,false)
-        s.barPeak=nil s.resetJourney=nil s.report.barMonitor=nil
         s.stage="selling" s.sellAt=now s.sellStart=u.used s.saleCheck=now+.4 s.saleRetry=now+5
         s.report.trips=s.report.trips+1 setTarget(s,nil) s.pulling={} teleport(s,SELL,"TP_entrega")
     end
-    if s.stage=="resetting" and resetTick(s,now) then return end
     if s.stage=="selling" then
         s.report.phase="Entregando • aguardando mochila zerar"
         if now>=s.saleCheck and u.used==0 then
@@ -685,22 +567,19 @@ local function tick(s)
     if not tool.Enabled then release(s) s.report.phase="Imã indisponível" return end
     if not u.visible then release(s) s.report.phase="Aguardando área do imã" return end
     local target=chooseTarget(s,u)
-    if barFailed(s,u,now) then return end
     local anchor=BASE
     if target then
-        anchor=aboveAnchor(s,s.target,target)
+        -- Pequeno deslocamento interno evita direcao de comprimento zero no jogo.
+        anchor=target-(s.approach or Vector3.new(0,0,-1))*.12
         setFrozen(s,true) s.report.followFrames=s.report.followFrames+1
         s.report.followPosition=vec(anchor)
     else setFrozen(s,false) target=BASE+Vector3.new(0,3,-30) end
     if (root.Position-anchor).Magnitude>.6 then root.AssemblyLinearVelocity=Vector3.new(0,0,0) end
-    if aim(s,target,anchor,s.target~=nil) then
-        if pointer(s) then s.report.phase=s.target and "Acima do alvo • segurando • "..s.targetMutation or "Procurando alvo • mouse segurado" end
+    if aim(s,target,anchor) then
+        if pointer(s) then s.report.phase=s.target and "Dentro do alvo • segurando • "..s.targetMutation or "Procurando alvo • mouse segurado" end
     else release(s) s.report.phase="Aguardando ponto livre" end
 end
 local function cleanup(s)
-    s.pose=nil
-    if s.poseBinding then pcall(function() Run:UnbindFromRenderStep(s.poseBinding) end) s.poseBinding=nil end
-    s.resetJourney=nil s.barPeak=nil s.report.barMonitor=nil
     probe.enabled=false probe.queue={} disconnect(s.listeners) release(s)
     if s.root and s.root.Parent then
         pcall(function() teleport(s,BASE,"TP_base_OFF") s.report.returnedToBase=true end)
@@ -737,17 +616,10 @@ start=function(delay)
     local remotes=RS:FindFirstChild("Remotes") local remote=remotes and remotes:FindFirstChild("DebrisMagnet")
     if not remote or not remote:IsA("RemoteEvent") then status.Text="Remote DebrisMagnet indisponível." return end
     local s={running=true,started=os.clock(),activateAt=os.clock()+math.max(0,tonumber(delay) or 3),listeners={},remote=remote,stage="farming",objects={},rows={},spawn={},spawnOrder={},mutationCodes={},phaseCodes={},completed={},doneObjects=setmetatable({},{__mode="k"}),classSeen=setmetatable({},{__mode="k"}),pulling={},cooldown={},held=false,lastFraction=0,mouseBehavior=UIS.MouseBehavior,mouseIcon=UIS.MouseIconEnabled}
-    s.report={format="scrap-pc-hold-v3.3-third-person",note="CFly deitado, 2.25 studs acima do topo. Camera normal de terceira pessoa, afastada e com horizonte em pe, acompanha o objeto sem girar com o corpo. Clique continuo, venda, prioridades e recuperacao da barra preservados.",placeId=game.PlaceId,running=true,phase="Iniciando em 3s",base=vec(BASE),sale=vec(SELL),reset=vec(RESET),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,barFalls=0,barResets=0,barResetReturns=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},mutationSamples={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0,targetSwitches=0,priorityPreemptions=0,followFrames=0,preferences={ouro=preferences.gold,vazio=preferences.void}}
+    s.report={format="scrap-pc-hold-v2-inside-priority",note="Mouse PC mantido; segue congelado dentro do primeiro alvo. Vazio > Ouro > normal quando selecionados. Nome/textura ativa identificam a mutacao; Phase nao e presumido. Entrega aguarda mochila zerada. Abrir GUI desliga; OFF retorna a base e restaura mobile.",placeId=game.PlaceId,running=true,phase="Iniciando em 3s",base=vec(BASE),sale=vec(SELL),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},mutationSamples={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0,targetSwitches=0,priorityPreemptions=0,followFrames=0,preferences={ouro=preferences.gold,vazio=preferences.void}}
     active=s lastReport=s.report
     local ok,err=pcall(function()
         installProbe(s)
-        -- Reaplica depois da camera padrao e antes da simulacao do Humanoid.
-        local bound=pcall(function()
-            local last=Enum.RenderPriority.Last.Value
-            Run:BindToRenderStep("NetoScrapCflyPose",last+1,function() enforcePose(s) end)
-        end)
-        if bound then s.poseBinding="NetoScrapCflyPose" end
-        if Run.PreSimulation then connect(Run.PreSimulation,function() enforcePose(s) end,s.listeners) end
         connect(remote.OnClientEvent,function(action,id,used,cap)
             if not valid(s) then return end
             if action=="Spawn" and type(id)=="table" then
@@ -759,7 +631,6 @@ start=function(delay)
                     s.spawn[data.Id]=data s.nextTargets=0
                 end
             elseif action=="Caught" then
-                s.lastCaughtAt=os.clock() s.barPeak=nil s.report.barMonitor=nil
                 s.report.caught=s.report.caught+1 s.pulling[id]=nil event(s,"server_Caught",{id=id,used=used,capacity=cap})
                 s.completed[id]=true local obj=s.objects[id] if obj then s.doneObjects[obj]=true end
                 if s.targetId==id or obj and s.target==obj then setTarget(s,nil) end
