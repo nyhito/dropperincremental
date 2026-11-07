@@ -1,4 +1,4 @@
--- Auto Scrap PC v3 / debug. Segura acima do alvo; recupera barra sem coleta.
+-- Auto Scrap PC v3.2 / debug. CFly deitado de brucos; camera no alvo.
 -- Base 61,3,-432 / entrega 128,3,-407. Sem alterar forca, barra ou pecas.
 local Players=game:GetService("Players")
 local Run=game:GetService("RunService")
@@ -96,7 +96,7 @@ local function pickPoint(s)
     local c=workspace.CurrentCamera if not c then return nil end
     local v=c.ViewportSize local p=s.point
     if p and p.vx==v.X and p.vy==v.Y and freePoint(p.x,p.y) then return p end
-    for _,fraction in ipairs({{.5,.40},{.65,.32},{.78,.30},{.42,.34},{.9,.25},{.55,.22},{.94,.45}}) do
+    for _,fraction in ipairs({{.5,.50},{.5,.40},{.65,.32},{.78,.30},{.42,.34},{.9,.25},{.55,.22},{.94,.45}}) do
         local x,y=math.floor(v.X*fraction[1]),math.floor(v.Y*fraction[2])
         if freePoint(x,y) then s.point={x=x,y=y,vx=v.X,vy=v.Y} return s.point end
     end s.point=nil return nil
@@ -498,10 +498,13 @@ setFrozen=function(s,value)
             event(s,"freeze_above")
         end
         s.root.Anchored=true
+        s.hum.PlatformStand=true s.hum.AutoRotate=false
         for part in pairs(s.savedCollisions) do if part.Parent then part.CanCollide=false end end
         s.root.AssemblyLinearVelocity=Vector3.new(0,0,0) s.root.AssemblyAngularVelocity=Vector3.new(0,0,0)
     elseif s.frozen then
+        s.pose=nil
         s.root.Anchored=s.originalAnchored
+        s.hum.PlatformStand=s.originalPlatformStand
         for part,value in pairs(s.savedCollisions or {}) do if part.Parent then part.CanCollide=value end end
         s.savedCollisions={} s.frozen=false event(s,"unfreeze")
     end
@@ -515,6 +518,7 @@ local function saveCharacter(s,char,root,hum)
     s.barPeak=nil
     s.char=char s.root=root s.hum=hum s.autoRotate=hum.AutoRotate s.report.recoveries=s.report.recoveries+(s.hadChar and 1 or 0) s.hadChar=true
     s.originalAnchored=root.Anchored
+    s.originalPlatformStand=hum.PlatformStand
     hum.AutoRotate=false s.atBase=false s.pulling={} setTarget(s,nil)
 end
 local function teleport(s,position,label)
@@ -537,7 +541,15 @@ local function aboveAnchor(s,obj,point)
         -- Extensao vertical real da caixa, incluindo objetos inclinados.
         top=center.Y+math.abs(box.RightVector.Y)*size.X*.5+math.abs(box.UpVector.Y)*size.Y*.5+math.abs(box.LookVector.Y)*size.Z*.5
     end
-    return Vector3.new(center.X,top+1.5,center.Z)-(s.approach or Vector3.new(0,0,-1))*.25
+    return Vector3.new(center.X,top+1.5,center.Z)
+end
+local function enforcePose(s)
+    if not valid(s) or not s.pose or not s.frozen or s.stage~="farming" or GS.MenuIsOpen then return end
+    if not s.root or not s.root.Parent or not s.hum or s.hum.Health<=0 then return end
+    s.hum.AutoRotate=false s.hum.PlatformStand=true
+    s.root.CFrame=s.pose.body
+    local c=workspace.CurrentCamera
+    if c==s.camera then c.CameraType=Enum.CameraType.Scriptable c.CFrame=s.pose.camera c.Focus=s.pose.focus end
 end
 local function aim(s,point,anchor,lookDown)
     local c=workspace.CurrentCamera if not c then return false end saveCamera(s,c)
@@ -546,17 +558,25 @@ local function aim(s,point,anchor,lookDown)
     if flat.Magnitude<.1 then flat=Vector3.new(0,0,-1) end
     local forward=flat.Unit local place=anchor+Vector3.new(0,3.5,0)-forward*8
     c.CameraType=Enum.CameraType.Scriptable
-    local look=CFrame.lookAt(place,point) c.CFrame=look
-    local ray=c:ScreenPointToRay(p.x,p.y)
-    local localDirection=look:VectorToObjectSpace(ray.Direction)
-    c.CFrame=look*CFrame.lookAt(Vector3.new(0,0,0),localDirection):Inverse()
-    c.Focus=CFrame.new(point)
     if lookDown then
-        local direction=point-anchor
-        local up=Vector3.new(0,1,0)
-        if direction.Magnitude>.01 and math.abs(direction.Unit.Y)>.98 then up=s.approach or Vector3.new(0,0,-1) end
-        s.root.CFrame=CFrame.lookAt(anchor,point,up)
-    else s.root.CFrame=CFrame.lookAt(anchor,anchor+forward) end
+        local heading=s.approach or Vector3.new(0,0,-1)
+        heading=Vector3.new(heading.X,0,heading.Z)
+        heading=heading.Magnitude>.01 and heading.Unit or Vector3.new(0,0,-1)
+        -- CFly: corpo deitado, face exatamente para baixo, nao apenas a cabeca.
+        s.root.CFrame=CFrame.lookAt(anchor,anchor-Vector3.new(0,1,0),heading)
+        -- A direcao REAL da camera aponta ao objeto. Nao gira para compensar o ponteiro.
+        place=Vector3.new(point.X,anchor.Y+2.5,point.Z)
+        c.CFrame=CFrame.lookAt(place,point,heading) c.Focus=CFrame.new(point)
+        s.pose={body=s.root.CFrame,camera=c.CFrame,focus=c.Focus}
+        s.report.faceDown={bodyY=s.root.CFrame.LookVector.Y,cameraY=c.CFrame.LookVector.Y}
+    else
+        s.pose=nil
+        local look=CFrame.lookAt(place,point) c.CFrame=look
+        local ray=c:ScreenPointToRay(p.x,p.y)
+        local localDirection=look:VectorToObjectSpace(ray.Direction)
+        c.CFrame=look*CFrame.lookAt(Vector3.new(0,0,0),localDirection):Inverse()
+        c.Focus=CFrame.new(point) s.root.CFrame=CFrame.lookAt(anchor,anchor+forward)
+    end
     return true
 end
 local function barFailed(s,u,now)
@@ -660,6 +680,8 @@ local function tick(s)
     else release(s) s.report.phase="Aguardando ponto livre" end
 end
 local function cleanup(s)
+    s.pose=nil
+    if s.poseBinding then pcall(function() Run:UnbindFromRenderStep(s.poseBinding) end) s.poseBinding=nil end
     s.resetJourney=nil s.barPeak=nil s.report.barMonitor=nil
     probe.enabled=false probe.queue={} disconnect(s.listeners) release(s)
     if s.root and s.root.Parent then
@@ -697,10 +719,17 @@ start=function(delay)
     local remotes=RS:FindFirstChild("Remotes") local remote=remotes and remotes:FindFirstChild("DebrisMagnet")
     if not remote or not remote:IsA("RemoteEvent") then status.Text="Remote DebrisMagnet indisponível." return end
     local s={running=true,started=os.clock(),activateAt=os.clock()+math.max(0,tonumber(delay) or 3),listeners={},remote=remote,stage="farming",objects={},rows={},spawn={},spawnOrder={},mutationCodes={},phaseCodes={},completed={},doneObjects=setmetatable({},{__mode="k"}),classSeen=setmetatable({},{__mode="k"}),pulling={},cooldown={},held=false,lastFraction=0,mouseBehavior=UIS.MouseBehavior,mouseIcon=UIS.MouseIconEnabled}
-    s.report={format="scrap-pc-hold-v3-above-recovery",note="Segue 1.5 studs acima do topo, olhando para baixo, com mouse mantido. Barra >=97% que cai sem Caught: espera confirmacao, vai ao reset por 1s e volta ao alvo. Vazio > Ouro > normal. Entrega espera mochila zerar; OFF restaura mobile e volta a base.",placeId=game.PlaceId,running=true,phase="Iniciando em 3s",base=vec(BASE),sale=vec(SELL),reset=vec(RESET),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,barFalls=0,barResets=0,barResetReturns=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},mutationSamples={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0,targetSwitches=0,priorityPreemptions=0,followFrames=0,preferences={ouro=preferences.gold,vazio=preferences.void}}
+    s.report={format="scrap-pc-hold-v3.2-cfly-face-down",note="CFly deitado de brucos acima do topo; corpo e camera para baixo no alvo. Mouse mantido. Barra >=97% que cai sem Caught: espera confirmacao, reset por 1s e retorno. Vazio > Ouro > normal. Venda e restauracao mobile preservadas.",placeId=game.PlaceId,running=true,phase="Iniciando em 3s",base=vec(BASE),sale=vec(SELL),reset=vec(RESET),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,barFalls=0,barResets=0,barResetReturns=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},mutationSamples={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0,targetSwitches=0,priorityPreemptions=0,followFrames=0,preferences={ouro=preferences.gold,vazio=preferences.void}}
     active=s lastReport=s.report
     local ok,err=pcall(function()
         installProbe(s)
+        -- Reaplica depois da camera padrao e antes da simulacao do Humanoid.
+        local bound=pcall(function()
+            local last=Enum.RenderPriority.Last.Value
+            Run:BindToRenderStep("NetoScrapCflyPose",last+1,function() enforcePose(s) end)
+        end)
+        if bound then s.poseBinding="NetoScrapCflyPose" end
+        if Run.PreSimulation then connect(Run.PreSimulation,function() enforcePose(s) end,s.listeners) end
         connect(remote.OnClientEvent,function(action,id,used,cap)
             if not valid(s) then return end
             if action=="Spawn" and type(id)=="table" then
