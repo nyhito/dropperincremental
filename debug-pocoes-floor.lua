@@ -1,4 +1,4 @@
--- Auto Scrap PC v3.2 / debug. CFly deitado de brucos; camera no alvo.
+-- Auto Scrap PC v3.3 / debug. CFly mais alto; camera em terceira pessoa.
 -- Base 61,3,-432 / entrega 128,3,-407. Sem alterar forca, barra ou pecas.
 local Players=game:GetService("Players")
 local Run=game:GetService("RunService")
@@ -17,6 +17,7 @@ for _,name in ipairs({"__NetoMagnetProbe","__NetoMagnetHoldProbe"}) do
 end
 local BASE,SELL=Vector3.new(61,3,-432),Vector3.new(128,3,-407)
 local RESET=Vector3.new(44,3,-418)
+local FOLLOW_CLEARANCE=2.25
 local pg=player:WaitForChild("PlayerGui")
 local alive,active,lastReport=true,nil,nil
 local start,stop,copy,close,paint,setFrozen
@@ -541,7 +542,8 @@ local function aboveAnchor(s,obj,point)
         -- Extensao vertical real da caixa, incluindo objetos inclinados.
         top=center.Y+math.abs(box.RightVector.Y)*size.X*.5+math.abs(box.UpVector.Y)*size.Y*.5+math.abs(box.LookVector.Y)*size.Z*.5
     end
-    return Vector3.new(center.X,top+1.5,center.Z)
+    s.targetBounds={obj=obj,center=center,size=ok and size or nil}
+    return Vector3.new(center.X,top+FOLLOW_CLEARANCE,center.Z)
 end
 local function enforcePose(s)
     if not valid(s) or not s.pose or not s.frozen or s.stage~="farming" or GS.MenuIsOpen then return end
@@ -564,13 +566,29 @@ local function aim(s,point,anchor,lookDown)
         heading=heading.Magnitude>.01 and heading.Unit or Vector3.new(0,0,-1)
         -- CFly: corpo deitado, face exatamente para baixo, nao apenas a cabeca.
         s.root.CFrame=CFrame.lookAt(anchor,anchor-Vector3.new(0,1,0),heading)
-        -- A direcao REAL da camera aponta ao objeto. Nao gira para compensar o ponteiro.
-        place=Vector3.new(point.X,anchor.Y+2.5,point.Z)
-        c.CFrame=CFrame.lookAt(place,point,heading) c.Focus=CFrame.new(point)
+        -- Vista normal de terceira pessoa: horizonte em pe, independente do corpo deitado.
+        local bounds=s.targetBounds local focus=point local radius=0
+        if bounds and bounds.obj==s.target then
+            focus=bounds.center
+            if bounds.size then radius=bounds.size.Magnitude*.5 end
+        end
+        local halfFov=math.rad(math.clamp(tonumber(c.FieldOfView) or 70,25,110))*.5
+        local aspect=math.max(.2,c.ViewportSize.X/math.max(1,c.ViewportSize.Y))
+        local narrow=math.min(halfFov,math.atan(math.tan(halfFov)*aspect))
+        local distance=math.max(14,radius/math.sin(narrow)*1.2)
+        place=focus-heading*distance+Vector3.new(0,math.max(5,distance*.4),0)
+        local now=os.clock()
+        if s.cameraPosition and s.cameraTarget==s.target and (s.cameraPosition-place).Magnitude<80 then
+            local dt=math.clamp(now-(s.cameraAt or now),0,.1)
+            place=s.cameraPosition+(place-s.cameraPosition)*(1-math.exp(-10*dt))
+        end
+        s.cameraPosition=place s.cameraTarget=s.target s.cameraAt=now
+        c.CFrame=CFrame.lookAt(place,focus,Vector3.new(0,1,0)) c.Focus=CFrame.new(focus)
         s.pose={body=s.root.CFrame,camera=c.CFrame,focus=c.Focus}
         s.report.faceDown={bodyY=s.root.CFrame.LookVector.Y,cameraY=c.CFrame.LookVector.Y}
+        s.report.cameraView={mode="third_person",distance=(place-focus).Magnitude,focus=vec(focus),clearance=FOLLOW_CLEARANCE}
     else
-        s.pose=nil
+        s.pose=nil s.cameraPosition=nil s.cameraTarget=nil
         local look=CFrame.lookAt(place,point) c.CFrame=look
         local ray=c:ScreenPointToRay(p.x,p.y)
         local localDirection=look:VectorToObjectSpace(ray.Direction)
@@ -719,7 +737,7 @@ start=function(delay)
     local remotes=RS:FindFirstChild("Remotes") local remote=remotes and remotes:FindFirstChild("DebrisMagnet")
     if not remote or not remote:IsA("RemoteEvent") then status.Text="Remote DebrisMagnet indisponível." return end
     local s={running=true,started=os.clock(),activateAt=os.clock()+math.max(0,tonumber(delay) or 3),listeners={},remote=remote,stage="farming",objects={},rows={},spawn={},spawnOrder={},mutationCodes={},phaseCodes={},completed={},doneObjects=setmetatable({},{__mode="k"}),classSeen=setmetatable({},{__mode="k"}),pulling={},cooldown={},held=false,lastFraction=0,mouseBehavior=UIS.MouseBehavior,mouseIcon=UIS.MouseIconEnabled}
-    s.report={format="scrap-pc-hold-v3.2-cfly-face-down",note="CFly deitado de brucos acima do topo; corpo e camera para baixo no alvo. Mouse mantido. Barra >=97% que cai sem Caught: espera confirmacao, reset por 1s e retorno. Vazio > Ouro > normal. Venda e restauracao mobile preservadas.",placeId=game.PlaceId,running=true,phase="Iniciando em 3s",base=vec(BASE),sale=vec(SELL),reset=vec(RESET),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,barFalls=0,barResets=0,barResetReturns=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},mutationSamples={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0,targetSwitches=0,priorityPreemptions=0,followFrames=0,preferences={ouro=preferences.gold,vazio=preferences.void}}
+    s.report={format="scrap-pc-hold-v3.3-third-person",note="CFly deitado, 2.25 studs acima do topo. Camera normal de terceira pessoa, afastada e com horizonte em pe, acompanha o objeto sem girar com o corpo. Clique continuo, venda, prioridades e recuperacao da barra preservados.",placeId=game.PlaceId,running=true,phase="Iniciando em 3s",base=vec(BASE),sale=vec(SELL),reset=vec(RESET),caught=0,trips=0,deposits=0,saleTimeouts=0,teleports=0,recoveries=0,barFalls=0,barResets=0,barResetReturns=0,presses=0,releases=0,resyncs=0,held=false,events={},inputErrors={},mutationSamples={},gameSent={Start=0,Catch=0,Stop=0},directSent={Start=0,Catch=0,Stop=0},manualTouches=0,targetSwitches=0,priorityPreemptions=0,followFrames=0,preferences={ouro=preferences.gold,vazio=preferences.void}}
     active=s lastReport=s.report
     local ok,err=pcall(function()
         installProbe(s)
